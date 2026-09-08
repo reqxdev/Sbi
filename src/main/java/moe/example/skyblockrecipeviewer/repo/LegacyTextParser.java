@@ -21,7 +21,7 @@ import net.minecraft.network.chat.Style;
  * the normalizeLegacyFormatting mojibake fixes are a direct behavioral port of that code,
  * adapted from that mod's (older, obfuscated Yarn-mapped) API calls to this project's Mojmap
  * equivalents (Component.literal/append/setStyle, Style.withColor/withBold/etc, all confirmed
- * against the MC 26.1.2 client jar). ChatFormatting doesn't expose an isColor()-style method
+ * against the MC 26.2 client jar). ChatFormatting doesn't expose an isColor()-style method
  * in this version, so color-vs-format is distinguished the same way the reference
  * implementation effectively does it: explicit format codes are enumerated, anything else
  * numeric/letter is treated as a color.

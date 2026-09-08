@@ -19,34 +19,21 @@ repositories {
 
 dependencies {
 	minecraft "com.mojang:minecraft:${project.minecraft_version}"
-	// 26.1+ is unobfuscated - Fabric's official porting guide for it says to remove the
+	// 26.2 is unobfuscated - Fabric's official porting guide says to remove the
 	// mappings line entirely (no obfuscation maps needed) and use plain implementation
 	// instead of modImplementation for mod dependencies, since there's no remap step.
 	// https://docs.fabricmc.net/develop/porting/
 
 	implementation "net.fabricmc:fabric-loader:${project.fabric_loader_version}"
 	implementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_api_version}"
-	// ClientCommandManager/ClientCommandRegistrationCallback/FabricClientCommandSource all
-	// live in fabric-command-api-v2's own separate CLIENT-ONLY source set on GitHub
-	// (fabric-command-api-v2/src/client/java/..., not src/main/java/...), which was my
-	// theory for why this specific class wasn't landing on the classpath - but
-	// modImplementation (the fix that theory implied) doesn't exist as a configuration in
-	// this project's Loom setup at all ("Could not find method modImplementation()"), which
-	// disproves that theory as the actionable fix, rather than confirming it. Reverted to
-	// plain implementation - see the chat message accompanying this change for what's
-	// actually needed next: real ground-truth data from inside the downloaded jar itself,
-	// since three straight coordinate-level fixes and this source-set theory have each
-	// produced a different failure without actually resolving the original one.
-	implementation "net.fabricmc.fabric-api:fabric-command-api-v2:3.1.0+00cb03469e"
-
 	implementation "me.shedaniel:RoughlyEnoughItems-fabric:${project.rei_version}"
 	// Point/Rectangle (me.shedaniel.math) used by REI's category/display API live in this
 	// separate library, not inside the REI jar itself - REI depends on it too but doesn't
 	// shade/bundle it, so consumers need to declare it themselves.
-	implementation "me.shedaniel.cloth:basic-math:+"
+	implementation "me.shedaniel.cloth:basic-math:0.6.1"
 	// Only needed for EventResult (used by REI's CategoryVisibilityPredicate API to hide
 	// the vanilla crafting category) - REI itself depends on this too at runtime.
-	implementation "dev.architectury:architectury-fabric:20.0.6"
+	implementation "dev.architectury:architectury-fabric:21.0.2"
 
 	// Plain Java library, no Kotlin runtime pulled in.
 	implementation "moe.nea:neurepoparser:${project.neurepoparser_version}"

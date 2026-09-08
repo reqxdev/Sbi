@@ -1,9 +1,9 @@
 package moe.example.skyblockrecipeviewer.repo;
 
+import java.util.HashMap;
 import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicBoolean;
 
@@ -24,15 +24,18 @@ public final class HypixelSkinManager {
 	private static final HypixelSkinManager INSTANCE = new HypixelSkinManager();
 
 	private final HypixelSkinDownloader downloader;
-	private final Map<String, SkullSkin> skins = new ConcurrentHashMap<>();
+	private record Snapshot(Map<String, SkullSkin> skins, Map<String, String> categories) {
+	}
+
+	private volatile Snapshot snapshot = new Snapshot(Map.of(), Map.of());
 	// See ItemCategoryResolver: the NEU repo's own items/<id>.json files (confirmed against a
 	// real one, e.g. ADAPTIVE_BOOTS.json) have NO "category" field at all - that assumption
 	// was mixed up with Hypixel's own /resources/skyblock/items response, which DOES carry a
 	// "category" per entry (e.g. "SWORD", "BOW"). Since this class already downloads and
 	// caches exactly that resource for skull skins, it's the natural place to also capture
 	// category from, rather than adding a whole second downloader for one extra field.
-	private final Map<String, String> categories = new ConcurrentHashMap<>();
 	private final AtomicBoolean loaded = new AtomicBoolean(false);
+	private CompletableFuture<Void> loadInFlight;
 	private final java.util.concurrent.ExecutorService executor = Executors.newSingleThreadExecutor(r -> {
 		Thread t = new Thread(r, "skyblock-skin-loader");
 		t.setDaemon(true);
@@ -64,9 +67,17 @@ public final class HypixelSkinManager {
 	public record SkullSkin(String value) {
 	}
 
-	public CompletableFuture<Void> ensureLoaded() {
+	public synchronized CompletableFuture<Void> ensureLoaded() {
 		if (loaded.get()) return CompletableFuture.completedFuture(null);
-		return CompletableFuture.runAsync(this::loadFromDisk, executor);
+		if (loadInFlight != null) return loadInFlight;
+		CompletableFuture<Void> created = CompletableFuture.runAsync(this::loadFromDisk, executor);
+		loadInFlight = created;
+		created.whenComplete((unused, error) -> {
+			synchronized (HypixelSkinManager.this) {
+				if (loadInFlight == created) loadInFlight = null;
+			}
+		});
+		return created;
 	}
 
 	/**
@@ -94,6 +105,8 @@ public final class HypixelSkinManager {
 	private int populateFrom(JsonObject root) {
 		if (root == null || !root.has("items")) return 0;
 		JsonArray items = root.getAsJsonArray("items");
+		Map<String, SkullSkin> skins = new HashMap<>();
+		Map<String, String> categories = new HashMap<>();
 		int skinCount = 0;
 		for (var element : items) {
 			try {
@@ -135,6 +148,7 @@ public final class HypixelSkinManager {
 		}
 		LOGGER.info("Parsed {} SkyBlock item categories and {} skull skins from Hypixel's item resource.",
 			categories.size(), skinCount);
+		snapshot = new Snapshot(Map.copyOf(skins), Map.copyOf(categories));
 		return skinCount;
 	}
 
@@ -154,7 +168,7 @@ public final class HypixelSkinManager {
 
 	public Optional<SkullSkin> getSkin(String skyblockId) {
 		if (skyblockId == null) return Optional.empty();
-		return Optional.ofNullable(skins.get(skyblockId));
+		return Optional.ofNullable(snapshot.skins().get(skyblockId));
 	}
 
 	/**
@@ -164,6 +178,6 @@ public final class HypixelSkinManager {
 	 */
 	public Optional<String> getCategory(String skyblockId) {
 		if (skyblockId == null) return Optional.empty();
-		return Optional.ofNullable(categories.get(skyblockId));
+		return Optional.ofNullable(snapshot.categories().get(skyblockId));
 	}
 }

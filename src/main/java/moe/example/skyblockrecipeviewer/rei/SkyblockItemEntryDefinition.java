@@ -35,7 +35,7 @@ import net.minecraft.world.item.component.CustomData;
  * several different swords all being minecraft:iron_sword under the hood) collapsed together
  * for tag/search/lookup purposes.
  *
- * Verified against the RoughlyEnoughItems-fabric-26.1.819 jar: every method below matches
+ * Verified against the RoughlyEnoughItems-fabric-26.2.821 jar: every method below matches
  * EntryDefinition's real method set exactly, including getTagsFor's generic signature
  * (Stream<? extends TagKey<?>>) and EntryTypeRegistry.register(Identifier, EntryDefinition).
  * cast()/acceptsNull()/getContainingNamespace() are confirmed default methods on the

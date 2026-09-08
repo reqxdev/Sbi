@@ -16,9 +16,9 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
+import java.util.HashMap;
 import java.util.Map;
 import java.util.Optional;
-import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
@@ -55,7 +55,6 @@ import java.util.concurrent.TimeUnit;
  */
 public final class SkyblockPriceManager {
 	private static final Logger LOGGER = LogManager.getLogger("SkyblockRecipeViewer/Price");
-	private static final SkyblockPriceManager INSTANCE = new SkyblockPriceManager();
 
 	private static final String BAZAAR_URL = "https://api.hypixel.net/v2/skyblock/bazaar";
 	private static final String COFLNET_NEU_PRICES_URL = "https://sky.coflnet.com/api/prices/neu";
@@ -65,6 +64,7 @@ public final class SkyblockPriceManager {
 		.resolve("skyblockrecipeviewer").resolve("bazaar-prices-cache.json");
 	private static final Path AUCTION_CACHE_FILE = FabricLoader.getInstance().getConfigDir()
 		.resolve("skyblockrecipeviewer").resolve("auction-prices-cache.json");
+	private static final SkyblockPriceManager INSTANCE = new SkyblockPriceManager();
 
 	public static SkyblockPriceManager getInstance() {
 		return INSTANCE;
@@ -85,8 +85,8 @@ public final class SkyblockPriceManager {
 		return t;
 	});
 
-	private final Map<String, BazaarPrice> bazaarPrices = new ConcurrentHashMap<>();
-	private final Map<String, Double> auctionLowestBin = new ConcurrentHashMap<>();
+	private volatile Map<String, BazaarPrice> bazaarPrices = Map.of();
+	private volatile Map<String, Double> auctionLowestBin = Map.of();
 
 	private SkyblockPriceManager() {
 		loadBazaarCacheFromDisk();
@@ -139,18 +139,20 @@ public final class SkyblockPriceManager {
 				.getAsJsonObject();
 			if (!root.has("prices")) return;
 			JsonObject prices = root.getAsJsonObject("prices");
+			Map<String, BazaarPrice> loaded = new HashMap<>();
 			int count = 0;
 			for (String itemId : prices.keySet()) {
 				try {
 					JsonObject entry = prices.getAsJsonObject(itemId);
 					double buy = entry.has("buy") ? entry.get("buy").getAsDouble() : Double.NaN;
 					double sell = entry.has("sell") ? entry.get("sell").getAsDouble() : Double.NaN;
-					bazaarPrices.put(itemId, new BazaarPrice(buy, sell));
+					loaded.put(itemId, new BazaarPrice(buy, sell));
 					count++;
 				} catch (Exception perItem) {
 					LOGGER.warn("Skipping corrupt cached Bazaar entry for {} ({}).", itemId, perItem.toString());
 				}
 			}
+			bazaarPrices = Map.copyOf(loaded);
 			LOGGER.info("Loaded {} Bazaar prices from local cache (pending live refresh).", count);
 		} catch (Exception e) {
 			LOGGER.warn("Could not read local Bazaar price cache ({}).", e.toString());
@@ -182,17 +184,19 @@ public final class SkyblockPriceManager {
 				.getAsJsonObject();
 			if (!root.has("prices")) return;
 			JsonObject prices = root.getAsJsonObject("prices");
+			Map<String, Double> loaded = new HashMap<>();
 			int count = 0;
 			for (String itemId : prices.keySet()) {
 				try {
 					JsonElement value = prices.get(itemId);
 					if (!value.isJsonPrimitive()) continue;
-					auctionLowestBin.put(itemId, value.getAsDouble());
+					loaded.put(itemId, value.getAsDouble());
 					count++;
 				} catch (Exception perItem) {
 					LOGGER.warn("Skipping corrupt cached auction entry for {} ({}).", itemId, perItem.toString());
 				}
 			}
+			auctionLowestBin = Map.copyOf(loaded);
 			LOGGER.info("Loaded {} Auction House lowest-BIN prices from local cache (pending live refresh).", count);
 		} catch (Exception e) {
 			LOGGER.warn("Could not read local Auction House price cache ({}).", e.toString());
@@ -241,17 +245,19 @@ public final class SkyblockPriceManager {
 			return;
 		}
 		JsonObject root = JsonParser.parseString(response.body()).getAsJsonObject();
+		Map<String, Double> refreshed = new HashMap<>();
 		int count = 0;
 		for (String itemId : root.keySet()) {
 			try {
 				JsonElement value = root.get(itemId);
 				if (!value.isJsonPrimitive()) continue;
-				auctionLowestBin.put(itemId, value.getAsDouble());
+				refreshed.put(itemId, value.getAsDouble());
 				count++;
 			} catch (Exception perItem) {
 				LOGGER.warn("Skipping malformed price entry for {}: {}", itemId, perItem.toString());
 			}
 		}
+		auctionLowestBin = Map.copyOf(refreshed);
 		LOGGER.info("Refreshed {} Auction House lowest-BIN prices from Coflnet.", count);
 		writeAuctionCacheToDisk();
 	}
@@ -269,6 +275,7 @@ public final class SkyblockPriceManager {
 			return;
 		}
 		JsonObject products = root.getAsJsonObject("products");
+		Map<String, BazaarPrice> refreshed = new HashMap<>();
 		int count = 0;
 		for (String itemId : products.keySet()) {
 			try {
@@ -279,12 +286,13 @@ public final class SkyblockPriceManager {
 				double instantSellPrice = lowestPricePerUnit(product, "sell_summary");
 				double instantBuyPrice = lowestPricePerUnit(product, "buy_summary");
 				if (Double.isNaN(instantBuyPrice) && Double.isNaN(instantSellPrice)) continue;
-				bazaarPrices.put(itemId, new BazaarPrice(instantBuyPrice, instantSellPrice));
+				refreshed.put(itemId, new BazaarPrice(instantBuyPrice, instantSellPrice));
 				count++;
 			} catch (Exception perItem) {
 				LOGGER.warn("Skipping malformed Bazaar product {}: {}", itemId, perItem.toString());
 			}
 		}
+		bazaarPrices = Map.copyOf(refreshed);
 		LOGGER.info("Refreshed {} Bazaar product prices.", count);
 		writeBazaarCacheToDisk();
 	}

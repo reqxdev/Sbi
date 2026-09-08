@@ -4,6 +4,8 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 
 import io.github.moulberry.repo.NEURepository;
@@ -23,6 +25,7 @@ import dev.architectury.event.EventResult;
 import moe.example.skyblockrecipeviewer.SkyblockRecipeViewer;
 import moe.example.skyblockrecipeviewer.repo.HypixelSkinManager;
 import moe.example.skyblockrecipeviewer.repo.NeuRepoManager;
+import moe.example.skyblockrecipeviewer.repo.NpcShopIndex;
 import moe.example.skyblockrecipeviewer.repo.SkyblockItemCache;
 import moe.example.skyblockrecipeviewer.repo.SkyblockItemResolver;
 import moe.example.skyblockrecipeviewer.repo.SkullTextureCache;
@@ -76,11 +79,50 @@ public class SkyblockReiPlugin implements REIClientPlugin {
 	 * real repo load invalidates it, at which point live data has taken over anyway).
 	 */
 	private static volatile List<ItemStack> diskCachedItemStacks = null;
+	private static volatile CompletableFuture<Void> bootstrapFuture;
+	private static final ExecutorService BOOTSTRAP_EXECUTOR = Executors.newSingleThreadExecutor(r -> {
+		Thread thread = new Thread(r, "skyblock-rei-bootstrap");
+		thread.setDaemon(true);
+		return thread;
+	});
 	/** True when an REI reload ran before the NEU repo was available, so displays need one
 	 * automatic reload after the repo becomes usable. */
 	private static volatile boolean repoBackedReiReloadNeeded = false;
 	private static volatile long lastRepoBackedReloadMs = 0L;
 	private static final long REPO_BACKED_RELOAD_COOLDOWN_MS = 5_000L;
+
+	public static synchronized CompletableFuture<Void> startBootstrap() {
+		if (bootstrapFuture != null) return bootstrapFuture;
+
+		NeuRepoManager manager = NeuRepoManager.getInstance();
+		CompletableFuture<Void> itemCacheReady = CompletableFuture.runAsync(() -> {
+			List<ItemStack> prepared = List.of();
+			if (!SkyblockItemCache.isStale()) {
+				Map<String, ItemStack> loaded = SkyblockItemCache.loadIntoResolverCache();
+				if (!loaded.isEmpty()) prepared = List.copyOf(loaded.values());
+			}
+			diskCachedItemStacks = prepared;
+		}, BOOTSTRAP_EXECUTOR);
+
+		CompletableFuture<Void> repoReady = manager.ensureLoaded().thenCompose(repository -> {
+			if (repository == null) return CompletableFuture.completedFuture(null);
+			return NpcShopIndex.ensureBuilt(manager, repository).handle((entries, error) -> null);
+		});
+
+		bootstrapFuture = CompletableFuture.allOf(
+			itemCacheReady, repoReady, HypixelSkinManager.getInstance().ensureLoaded());
+		bootstrapFuture.whenComplete((unused, error) -> {
+			BOOTSTRAP_EXECUTOR.shutdown();
+			if (error != null) {
+				SkyblockRecipeViewer.LOGGER.error("SkyBlock REI bootstrap failed.", error);
+				return;
+			}
+			SkyblockRecipeViewer.LOGGER.info("SkyBlock REI data bootstrap completed.");
+			requestRepoBackedReiReload();
+			tryLivePush();
+		});
+		return bootstrapFuture;
+	}
 
 	@Override
 	public void registerCategories(CategoryRegistry registry) {
@@ -169,54 +211,23 @@ public class SkyblockReiPlugin implements REIClientPlugin {
 		// tries to build any EntryStack with it, a few lines below).
 		SkyblockItemEntryDefinition.registerType();
 
-		NeuRepoManager manager = NeuRepoManager.getInstance();
-		// Never resolve thousands of item stacks inside REI's initialization callback, even if
-		// the repo happens to have finished loading already. The expensive SNBT/DFU/item-skin
-		// conversion is prepared as one background pass by tryLivePush() below; this callback
-		// should only register already-cached stacks. Doing the resolve here was the remaining
-		// source of cold-start REI stutter: timing could make the repo ready before REI called
-		// registerEntries(), which then moved the entire ~8k-item conversion onto REI's reload
-		// thread.
-		pushCachedItemEntries(registry);
+		startBootstrap();
+		if (!pushCachedItemEntries(registry)) {
+			repoBackedReiReloadNeeded = true;
+		}
 		SkyblockRecipeViewer.LOGGER.info(
-			"Using the persistent SkyBlock item cache during REI initialization; item data is "
-				+ "repo-SHA cached and is only rebuilt when the repo changes.");
-
-		// .thenRun() runs on whatever thread completes the future - our own background
-		// executors (NeuRepoManager/HypixelSkinManager) here, not the main client thread.
-		// REI's registries (and VanillaEntryTypes.ITEM's lazy resolution, which
-		// SkyblockItemEntryDefinition's static init touches) aren't safe to touch off-thread -
-		// doing so throws inside that static initializer, which then poisons the class
-		// permanently (NoClassDefFoundError on every subsequent call) until the next restart.
-		// Hop back onto the render thread first, same as REI itself always calls
-		// registerEntries/registerDisplays on the main thread to begin with. Kicking these off
-		// (ensureLoaded, not awaiting them) is still fine to do here since it's just scheduling
-		// background work, not blocking on it.
-		CompletableFuture.allOf(manager.ensureLoaded(), HypixelSkinManager.getInstance().ensureLoaded())
-			.thenRun(SkyblockReiPlugin::tryLivePush);
+			"Using only asynchronously prepared SkyBlock item data during REI initialization.");
 	}
 
 	/**
-	 * Instant, network-free fallback for when live repo/skin data isn't loaded yet this
-	 * session: reads SkyblockItemCache's on-disk cache (if any exists from a previous
-	 * successful run) straight into REI, so the very first thing the player sees isn't an
-	 * empty search panel. See registerEntries()'s call site and SkyblockItemCache's class
-	 * javadoc for why a possibly-one-version-stale list here is an acceptable, deliberate
-	 * tradeoff - tryLivePush() corrects it shortly after if the repo actually changed.
+	 * Registers the immutable item snapshot prepared by startBootstrap(). This method never
+	 * reads disk or decodes SNBT, so REI's registration callback remains non-blocking.
 	 */
-	private static void pushCachedItemEntries(EntryRegistry registry) {
-		// REI clears and rebuilds its EntryRegistry on every real plugin reload. The expensive
-		// part is resolving the NEU item data into fully-NBT'd ItemStacks, not constructing the
-		// lightweight EntryStack wrappers. Keep the resolved ItemStacks in memory after the
-		// first disk read and simply re-register those wrappers on every reload.
+	private static boolean pushCachedItemEntries(EntryRegistry registry) {
+		// REI clears and rebuilds its EntryRegistry on every real plugin reload. Re-register
+		// lightweight wrappers here while retaining the prepared ItemStacks across reloads.
 		List<ItemStack> cached = diskCachedItemStacks;
-		if (cached == null) {
-			if (SkyblockItemCache.isStale()) return;
-			Map<String, ItemStack> loaded = SkyblockItemCache.loadIntoResolverCache();
-			if (loaded.isEmpty()) return;
-			cached = List.copyOf(loaded.values());
-			diskCachedItemStacks = cached;
-		}
+		if (cached == null || cached.isEmpty()) return false;
 
 		List<EntryStack<ItemStack>> entries = new ArrayList<>(cached.size());
 		for (ItemStack stack : cached) {
@@ -225,6 +236,7 @@ public class SkyblockReiPlugin implements REIClientPlugin {
 		registry.addEntries(entries);
 		SkyblockRecipeViewer.LOGGER.info(
 			"Registered {} SkyBlock item entries from the persistent item cache.", entries.size());
+		return true;
 	}
 
 	/**
@@ -405,7 +417,7 @@ public class SkyblockReiPlugin implements REIClientPlugin {
 	}
 
 	/**
-	 * Confirmed by decompiling RoughlyEnoughItems-26.1.819.jar: REI only ever starts a
+	 * Confirmed by decompiling RoughlyEnoughItems-26.2.821.jar: REI only ever starts a
 	 * plugin reload from two places, both in RoughlyEnoughItemsCoreClient - a
 	 * PRE_UPDATE_RECIPES hook that calls
 	 * {@code reloadPlugins(null, ReloadStage.START, registryAccess)}, and a tag-update hook

@@ -213,7 +213,7 @@ public final class SkyblockItemResolver {
 				stack.set(net.minecraft.core.component.DataComponents.LORE, new ItemLore(loreLines));
 			}
 		}
-		// MC 26.1.2 has a component (minecraft:tooltip_display / net.minecraft.world.item.
+		// MC 26.2 has a component (minecraft:tooltip_display / net.minecraft.world.item.
 		// component.TooltipDisplay - confirmed present via decompile) that independently
 		// controls which components actually render in the tooltip, separate from whether
 		// the component's data exists on the stack. There's a dedicated DFU fixer

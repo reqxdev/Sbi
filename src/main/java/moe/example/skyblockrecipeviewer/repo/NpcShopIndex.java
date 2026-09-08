@@ -10,6 +10,7 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
@@ -58,7 +59,8 @@ public final class NpcShopIndex {
 
 	private static volatile NEURepository builtForRepo;
 	private static volatile List<Entry> cached = List.of();
-	private static volatile boolean buildInProgress = false;
+	private static volatile NEURepository buildingForRepo;
+	private static volatile CompletableFuture<List<Entry>> buildInFlight;
 
 	private NpcShopIndex() {
 	}
@@ -79,29 +81,37 @@ public final class NpcShopIndex {
 	public static List<Entry> getEntries(NeuRepoManager manager) {
 		NEURepository repo = manager.getLoadedRepoOrNull();
 		if (repo == null) return List.of();
-		if (repo != builtForRepo && !buildInProgress) {
-			triggerBuild(manager, repo);
-		}
+		ensureBuilt(manager, repo);
 		return cached;
 	}
 
-	private static synchronized void triggerBuild(NeuRepoManager manager, NEURepository repo) {
-		if (buildInProgress || repo == builtForRepo) return;
-		buildInProgress = true;
-		EXECUTOR.submit(() -> {
-			try {
-				cached = buildFromDisk(manager);
-				builtForRepo = repo;
-			} finally {
-				buildInProgress = false;
+	public static synchronized CompletableFuture<List<Entry>> ensureBuilt(
+			NeuRepoManager manager, NEURepository repo) {
+		if (repo == builtForRepo) return CompletableFuture.completedFuture(cached);
+		if (repo == buildingForRepo && buildInFlight != null) return buildInFlight;
+
+		CompletableFuture<List<Entry>> created =
+			CompletableFuture.supplyAsync(() -> buildFromDisk(manager, repo), EXECUTOR);
+		buildingForRepo = repo;
+		buildInFlight = created;
+		created.whenComplete((entries, error) -> {
+			synchronized (NpcShopIndex.class) {
+				if (buildInFlight != created) return;
+				if (error == null) {
+					cached = entries;
+					builtForRepo = repo;
+				}
+				buildingForRepo = null;
+				buildInFlight = null;
 			}
 		});
+		return created;
 	}
 
-	private static List<Entry> buildFromDisk(NeuRepoManager manager) {
+	private static List<Entry> buildFromDisk(NeuRepoManager manager, NEURepository repo) {
 		Path itemsDir = manager.getRepoDir().resolve("items");
 		List<Entry> result = new ArrayList<>();
-		for (NEUItem item : manager.getAllItems()) {
+		for (NEUItem item : repo.getItems().getItems().values()) {
 			String id = item.getSkyblockItemId();
 			if (id == null || id.isBlank()) continue;
 			Path itemFile = itemsDir.resolve(id + ".json");

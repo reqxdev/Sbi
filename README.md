@@ -26,7 +26,7 @@ item data and registers SkyBlock crafting recipes as REI recipe displays.
    authoritative source for skull ("SKULL_ITEM") items: when a skin exists for an id, the
    display is forced to a `PLAYER_HEAD` carrying that real texture via
    `ResolvableProfile.createResolved(...)`, the same mechanism vanilla uses for any
-   NBT-defined custom head. This is verified against the MC 26.1.2 client jar you uploaded
+   NBT-defined custom head. This is verified against the MC 26.2 client jar
    (`ResolvableProfile`, `DataComponents.PROFILE` both confirmed to exist with this exact
    shape) - **the one part I could not verify against that jar is `com.mojang.authlib`**
    (`GameProfile`/`PropertyMap`/`Property`), since authlib isn't bundled inside
@@ -121,28 +121,14 @@ sanity-check on first build:
   `constants/essencecosts.json` from your own downloaded repo copy and compare against
   `ReforgeStore.parseReforge`/`EssenceStore.readCostsFile` if the reforge or essence
   categories come up empty after a successful repo download — that's the first place to look.
-- Exact `fabric-api` / `fabric-loader` version strings for 26.2 in `gradle.properties` —
-  placeholders, check https://fabricmc.net/develop/ once you're set up.
+- The build directly targets Minecraft 26.2, Fabric Loader 0.19.3 or newer, Java 25,
+  and Mojang's unobfuscated names. Fabric API and REI use their 26.2 artifacts.
 
-## Multi-version support (26.1.2 + 26.2)
-Decompiled both `minecraft-client.jar` builds (world_version 4790 for 26.1.2, 4903 for 26.2)
-and both REI jars, and diffed every class this mod actually calls: `Identifier`,
-`BuiltInRegistries`, `ItemStack`/`Items`, and the full REI plugin/category/entry/slot API.
-All of them are byte-identical between the two versions — so this ships as **one jar**
-covering both, no version-splitting (Stonecutter, separate source sets, etc.) needed.
+## Minecraft version support
 
-Practically: the project compiles against 26.1.2 (the older of the two — safer default,
-since a mod built against the older API is more likely to still run on the newer one than
-the reverse), and `fabric.mod.json` declares `"minecraft": ">=26.1.2 <=26.2.x"`.
-
-**One thing I couldn't verify:** Fabric API itself is published as a separate per-version
-artifact, and I don't know whether the 26.1.2 build of Fabric API declares itself loadable
-on 26.2 too, or whether Fabric splits it there and you'd need to select the right Fabric API
-version per game version at runtime (this mod's own code doesn't care either way — it's only
-a question of what `fabric_api_version` resolves to). Worth a quick check on
-https://modrinth.com/mod/fabric-api/versions when you set up the run configs; if Fabric API
-does split there, the fix is just picking the matching Fabric API build per launch, this
-mod's jar itself doesn't need to change.
+This project targets Minecraft 26.2 directly. It compiles against the 26.2 client with
+Mojang's unobfuscated names, requires Java 25 and Fabric Loader 0.19.3 or newer, and declares
+Minecraft 26.2 exactly in `fabric.mod.json`. Only 26.2 artifacts are resolved.
 
 ## Building
 **Windows:** double-click `build.bat` (or run it from a terminal in this folder). It runs
@@ -157,7 +143,5 @@ and `repo.nea.moe`. You'll need a JDK installed (Java 25) and on PATH.
 ```
 The jar lands in `build/libs/`.
 
-I couldn't run this build myself — my sandbox's network allowlist doesn't include those
-hosts, so this hasn't been compiled end-to-end. If something doesn't line up (most likely
-one of the two bullet points above, or in the multi-version section below), the fix is a
-one-line getter rename, not a redesign.
+The full Gradle build validates compilation, resource processing, packaging, and the
+configured access widener checks.

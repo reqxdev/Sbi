@@ -32,11 +32,9 @@ public class SkyblockRecipeViewer implements ClientModInitializer {
 		moe.example.skyblockrecipeviewer.rei.SkyblockItemRenameTooltipHandler.register();
 		moe.example.skyblockrecipeviewer.command.SkyblockCommands.register();
 
-		// Loads whatever's already on disk (no network) so REI's plugin-load phase - which
-		// happens at game launch, before any server is joined - has recipes ready
-		// immediately from the second launch onward.
-		NeuRepoManager.getInstance().loadAsync();
-		HypixelSkinManager.getInstance().ensureLoaded();
+		// Prepare all local REI data as early as Minecraft's registries safely allow. This never
+		// blocks client startup or performs network I/O; network refreshes remain join-driven.
+		moe.example.skyblockrecipeviewer.rei.SkyblockReiPlugin.startBootstrap();
 
 		ClientPlayConnectionEvents.JOIN.register((handler, sender, client) -> {
 			var server = client.getCurrentServer();
@@ -66,7 +64,7 @@ public class SkyblockRecipeViewer implements ClientModInitializer {
 			// checkForUpdatesOnJoin/refreshFromNetwork update the underlying data, but don't
 			// know anything about REI themselves. See SkyblockReiPlugin.tryLivePush's javadoc.
 			java.util.concurrent.CompletableFuture.allOf(repoUpdate, skinRefresh)
-				.thenRun(() -> client.execute(moe.example.skyblockrecipeviewer.rei.SkyblockReiPlugin::tryLivePush));
+				.thenRun(moe.example.skyblockrecipeviewer.rei.SkyblockReiPlugin::tryLivePush);
 
 			// Failsafe: 30s after join, unconditionally re-run the whole thing again,
 			// regardless of whether the immediate attempt above already succeeded. Covers
@@ -84,8 +82,7 @@ public class SkyblockRecipeViewer implements ClientModInitializer {
 					var retryRepo = NeuRepoManager.getInstance().checkForUpdatesOnJoin();
 					var retrySkin = HypixelSkinManager.getInstance().refreshFromNetwork();
 					java.util.concurrent.CompletableFuture.allOf(retryRepo, retrySkin)
-						.thenRun(() -> client.execute(
-							moe.example.skyblockrecipeviewer.rei.SkyblockReiPlugin::tryLivePush));
+						.thenRun(moe.example.skyblockrecipeviewer.rei.SkyblockReiPlugin::tryLivePush);
 				});
 		});
 

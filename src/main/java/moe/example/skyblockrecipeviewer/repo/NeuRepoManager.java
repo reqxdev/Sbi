@@ -34,6 +34,7 @@ public final class NeuRepoManager {
 	private final RepoDownloader downloader;
 	private final boolean weManageRepo;
 	private final AtomicReference<NEURepository> loadedRepo = new AtomicReference<>();
+	private CompletableFuture<NEURepository> loadInFlight;
 	private final java.util.concurrent.ExecutorService executor = Executors.newSingleThreadExecutor(r -> {
 		Thread t = new Thread(r, "skyblock-repo-loader");
 		t.setDaemon(true);
@@ -86,14 +87,23 @@ public final class NeuRepoManager {
 	 * re-parses the whole repo from disk, which on a slow first launch can be enough to blow
 	 * past a caller's timeout even though the data was already available a moment earlier.
 	 */
-	public CompletableFuture<NEURepository> ensureLoaded() {
+	public synchronized CompletableFuture<NEURepository> ensureLoaded() {
 		NEURepository cached = loadedRepo.get();
 		if (cached != null) return CompletableFuture.completedFuture(cached);
 		return loadAsync();
 	}
 
-	public CompletableFuture<NEURepository> loadAsync() {
-		return CompletableFuture.supplyAsync(this::loadFromDiskWithRetries, executor);
+	public synchronized CompletableFuture<NEURepository> loadAsync() {
+		if (loadInFlight != null) return loadInFlight;
+		CompletableFuture<NEURepository> created =
+			CompletableFuture.supplyAsync(this::loadFromDiskWithRetries, executor);
+		loadInFlight = created;
+		created.whenComplete((repository, error) -> {
+			synchronized (NeuRepoManager.this) {
+				if (loadInFlight == created) loadInFlight = null;
+			}
+		});
+		return created;
 	}
 
 	/**
@@ -137,12 +147,10 @@ public final class NeuRepoManager {
 			NEURepository repository = NEURepository.of(repoDir);
 			try {
 				repository.reload();
-				loadedRepo.set(repository);
 				// Pre-build the derived recipe index on the background repo-loader thread so the
 				// first REI lookup does not have to walk every item. NPC-shop indexing is also
 				// kicked off here; it has its own worker because it reads raw item JSON from disk.
 				ensureRecipeCache(repository);
-				NpcShopIndex.getEntries(this);
 				// Reforge/essence data lives in constants/*.json, which the repo download
 				// already puts on disk under repoDir regardless of whether NEURepository's own
 				// item parsing succeeded - reload these straight off disk here too, right after
@@ -150,6 +158,8 @@ public final class NeuRepoManager {
 				// failure behavior, same "another mod may be mid-rewrite" tolerance).
 				ReforgeStore.getInstance().reload(repoDir);
 				EssenceStore.getInstance().reload(repoDir);
+				loadedRepo.set(repository);
+				NpcShopIndex.ensureBuilt(this, repository);
 				return repository;
 			} catch (Exception e) {
 				lastError = e;
