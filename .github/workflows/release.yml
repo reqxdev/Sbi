@@ -1,0 +1,58 @@
+name: rolling release
+on:
+  push:
+    branches: [master, main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: rolling-release
+  cancel-in-progress: true
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: checkout repository
+        uses: actions/checkout@v6
+
+      - name: validate gradle wrapper
+        uses: gradle/actions/wrapper-validation@v6
+
+      - name: setup jdk
+        uses: actions/setup-java@v5
+        with:
+          java-version: '25'
+          distribution: 'microsoft'
+
+      - name: make gradle wrapper executable
+        run: chmod +x ./gradlew
+
+      - name: build
+        run: ./gradlew clean build
+
+      - name: collect release artifacts
+        run: |
+          mkdir -p release
+          find build/libs -name '*.jar' ! -name '*-sources.jar' ! -name '*-dev.jar' ! -name '*-dev-*.jar' \
+            -exec cp {} release/ \;
+          ls -l release
+
+      - name: move latest tag
+        run: |
+          git tag -f latest "$GITHUB_SHA"
+          git push -f origin latest
+
+      - name: publish rolling release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete latest --yes --cleanup-tag=false 2>/dev/null || true
+          gh release create latest release/*.jar \
+            --title "Latest Release" \
+            --notes "Rolling build of \`${GITHUB_SHA::7}\` from \`${GITHUB_REF_NAME}\`.
+
+          Automatically rebuilt on every push. Download the mod jar (not the sources jar) and drop it in your \`mods\` folder." \
+            --latest
