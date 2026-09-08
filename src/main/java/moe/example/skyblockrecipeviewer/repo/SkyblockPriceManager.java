@@ -59,6 +59,7 @@ public final class SkyblockPriceManager {
 	private static final String BAZAAR_URL = "https://api.hypixel.net/v2/skyblock/bazaar";
 	private static final String COFLNET_NEU_PRICES_URL = "https://sky.coflnet.com/api/prices/neu";
 	private static final long REFRESH_INTERVAL_MINUTES = 5;
+	private static final long MAX_PRICE_RESPONSE_BYTES = 32L * 1024 * 1024;
 
 	private static final Path BAZAAR_CACHE_FILE = FabricLoader.getInstance().getConfigDir()
 		.resolve("skyblockrecipeviewer").resolve("bazaar-prices-cache.json");
@@ -239,7 +240,8 @@ public final class SkyblockPriceManager {
 	private void refreshAuctionLowestBins() throws Exception {
 		HttpRequest request = HttpRequest.newBuilder(URI.create(COFLNET_NEU_PRICES_URL))
 			.timeout(Duration.ofSeconds(20)).GET().build();
-		HttpResponse<String> response = http.send(request, HttpResponse.BodyHandlers.ofString());
+		HttpResponse<String> response = http.send(request,
+			HttpResponse.BodyHandlers.limiting(HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8), MAX_PRICE_RESPONSE_BYTES));
 		if (response.statusCode() != 200) {
 			LOGGER.warn("Coflnet /api/prices/neu returned HTTP {}", response.statusCode());
 			return;
@@ -264,7 +266,8 @@ public final class SkyblockPriceManager {
 
 	private void refreshBazaar() throws Exception {
 		HttpRequest request = HttpRequest.newBuilder(URI.create(BAZAAR_URL)).timeout(Duration.ofSeconds(15)).GET().build();
-		HttpResponse<String> response = http.send(request, HttpResponse.BodyHandlers.ofString());
+		HttpResponse<String> response = http.send(request,
+			HttpResponse.BodyHandlers.limiting(HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8), MAX_PRICE_RESPONSE_BYTES));
 		if (response.statusCode() != 200) {
 			LOGGER.warn("Bazaar API returned HTTP {}", response.statusCode());
 			return;

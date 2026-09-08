@@ -2,6 +2,7 @@ package moe.example.skyblockrecipeviewer.repo;
 
 import java.io.IOException;
 import java.io.InputStream;
+import java.io.OutputStream;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
@@ -34,6 +35,11 @@ public final class RepoDownloader {
 	private static final String OWNER = "NotEnoughUpdates";
 	private static final String REPO = "NotEnoughUpdates-REPO";
 	private static final String BRANCH = "master";
+	private static final long MAX_METADATA_BYTES = 1024 * 1024;
+	private static final long MAX_ARCHIVE_BYTES = 256L * 1024 * 1024;
+	private static final long MAX_EXTRACTED_ENTRY_BYTES = 32L * 1024 * 1024;
+	private static final long MAX_EXTRACTED_TOTAL_BYTES = 512L * 1024 * 1024;
+	private static final int MAX_ARCHIVE_ENTRIES = 50_000;
 
 	private final Path repoDir;
 	private final Path stagingDir;
@@ -98,9 +104,11 @@ public final class RepoDownloader {
 		String url = "https://api.github.com/repos/" + OWNER + "/" + REPO + "/commits/" + BRANCH;
 		HttpRequest request = HttpRequest.newBuilder(URI.create(url))
 			.header("Accept", "application/vnd.github+json")
+			.timeout(Duration.ofSeconds(15))
 			.GET()
 			.build();
-		HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
+		HttpResponse<String> response = httpClient.send(request,
+			HttpResponse.BodyHandlers.limiting(HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8), MAX_METADATA_BYTES));
 		if (response.statusCode() != 200) {
 			throw new IOException("GitHub API returned HTTP " + response.statusCode());
 		}
@@ -256,13 +264,24 @@ public final class RepoDownloader {
 
 	private Path downloadArchive(String url) throws IOException, InterruptedException {
 		Path tempZip = Files.createTempFile("skyblock-repo", ".zip");
-		HttpRequest request = HttpRequest.newBuilder(URI.create(url)).GET().build();
-		HttpResponse<Path> response = httpClient.send(request,
-			HttpResponse.BodyHandlers.ofFile(tempZip));
-		if (response.statusCode() != 200) {
-			throw new IOException("GitHub archive download returned HTTP " + response.statusCode());
+		boolean complete = false;
+		try {
+			HttpRequest request = HttpRequest.newBuilder(URI.create(url))
+				.timeout(Duration.ofSeconds(60))
+				.GET()
+				.build();
+			HttpResponse<Path> response = httpClient.send(request,
+				HttpResponse.BodyHandlers.limiting(HttpResponse.BodyHandlers.ofFile(tempZip), MAX_ARCHIVE_BYTES));
+			if (response.statusCode() != 200) {
+				throw new IOException("GitHub archive download returned HTTP " + response.statusCode());
+			}
+			complete = true;
+			return response.body();
+		} finally {
+			if (!complete) {
+				Files.deleteIfExists(tempZip);
+			}
 		}
-		return response.body();
 	}
 
 	/**
@@ -274,8 +293,14 @@ public final class RepoDownloader {
 		Path normalizedTarget = targetDir.normalize();
 		try (InputStream fis = Files.newInputStream(zipFile);
 			 ZipInputStream zis = new ZipInputStream(fis)) {
+			byte[] buffer = new byte[8192];
+			long extractedTotal = 0;
+			int entryCount = 0;
 			ZipEntry entry;
 			while ((entry = zis.getNextEntry()) != null) {
+				if (++entryCount > MAX_ARCHIVE_ENTRIES) {
+					throw new IOException("Repository archive contains too many entries");
+				}
 				if (entry.isDirectory()) continue;
 				String name = entry.getName();
 				int slash = name.indexOf('/');
@@ -287,7 +312,25 @@ public final class RepoDownloader {
 					throw new IOException("Zip entry escapes target directory (zip-slip): " + name);
 				}
 				Files.createDirectories(outPath.getParent());
-				Files.copy(zis, outPath, StandardCopyOption.REPLACE_EXISTING);
+				long declaredSize = entry.getSize();
+				if (declaredSize > MAX_EXTRACTED_ENTRY_BYTES
+					|| declaredSize >= 0 && declaredSize > MAX_EXTRACTED_TOTAL_BYTES - extractedTotal) {
+					throw new IOException("Repository archive entry exceeds extraction limits: " + name);
+				}
+
+				long entryBytes = 0;
+				try (OutputStream output = Files.newOutputStream(outPath)) {
+					int read;
+					while ((read = zis.read(buffer)) != -1) {
+						if (read > MAX_EXTRACTED_ENTRY_BYTES - entryBytes
+							|| read > MAX_EXTRACTED_TOTAL_BYTES - extractedTotal) {
+							throw new IOException("Repository archive exceeds extraction limits");
+						}
+						output.write(buffer, 0, read);
+						entryBytes += read;
+						extractedTotal += read;
+					}
+				}
 			}
 		}
 	}

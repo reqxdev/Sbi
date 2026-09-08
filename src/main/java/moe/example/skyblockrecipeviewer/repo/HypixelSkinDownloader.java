@@ -28,6 +28,7 @@ import org.apache.logging.log4j.Logger;
 public final class HypixelSkinDownloader {
 
 	private static final String ENDPOINT = "https://api.hypixel.net/v2/resources/skyblock/items";
+	private static final long MAX_RESPONSE_BYTES = 64L * 1024 * 1024;
 
 	private final Path cacheFile;
 	private final Logger logger;
@@ -53,18 +54,23 @@ public final class HypixelSkinDownloader {
 	 */
 	public JsonObject fetchAndCacheReturningJson() {
 		try {
-			HttpRequest request = HttpRequest.newBuilder(URI.create(ENDPOINT)).GET().build();
-			HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
+			HttpRequest request = HttpRequest.newBuilder(URI.create(ENDPOINT))
+				.timeout(Duration.ofSeconds(30))
+				.GET()
+				.build();
+			HttpResponse<String> response = httpClient.send(request,
+				HttpResponse.BodyHandlers.limiting(HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8), MAX_RESPONSE_BYTES));
 			if (response.statusCode() != 200) {
 				throw new IOException("Hypixel API returned HTTP " + response.statusCode());
 			}
-			JsonObject json = JsonParser.parseString(response.body()).getAsJsonObject();
+			String responseBody = response.body();
+			JsonObject json = JsonParser.parseString(responseBody).getAsJsonObject();
 			if (!json.has("success") || !json.get("success").getAsBoolean()) {
 				throw new IOException("Hypixel API response did not report success");
 			}
 			Files.createDirectories(cacheFile.getParent());
-			Files.writeString(cacheFile, response.body(), StandardCharsets.UTF_8);
-			logger.info("Fetched Hypixel SkyBlock item skins ({} bytes).", response.body().length());
+			Files.writeString(cacheFile, responseBody, StandardCharsets.UTF_8);
+			logger.info("Fetched Hypixel SkyBlock item skins ({} bytes).", responseBody.getBytes(StandardCharsets.UTF_8).length);
 			return json;
 		} catch (Exception e) {
 			logger.warn("Could not fetch Hypixel SkyBlock item skins ({}).", e.toString());
