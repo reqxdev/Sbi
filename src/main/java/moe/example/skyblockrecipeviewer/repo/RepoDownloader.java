@@ -9,6 +9,7 @@ import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.AtomicMoveNotSupportedException;
 import java.nio.file.StandardCopyOption;
 import java.time.Duration;
 import java.util.zip.ZipEntry;
@@ -35,6 +36,8 @@ public final class RepoDownloader {
 	private static final String BRANCH = "master";
 
 	private final Path repoDir;
+	private final Path stagingDir;
+	private final Path backupDir;
 	private final Path commitFile;
 	private final Logger logger;
 	private final HttpClient httpClient = HttpClient.newBuilder()
@@ -55,6 +58,8 @@ public final class RepoDownloader {
 	 */
 	public RepoDownloader(Path neuConfigDir, Logger logger) {
 		this.repoDir = neuConfigDir.resolve("repo");
+		this.stagingDir = neuConfigDir.resolve("repo.update-staging");
+		this.backupDir = neuConfigDir.resolve("repo.update-backup");
 		this.commitFile = neuConfigDir.resolve("currentCommit.json");
 		this.logger = logger;
 	}
@@ -80,7 +85,13 @@ public final class RepoDownloader {
 		json.addProperty("sha", sha);
 		json.addProperty("time", System.currentTimeMillis());
 		Files.createDirectories(commitFile.getParent());
-		Files.writeString(commitFile, json.toString(), StandardCharsets.UTF_8);
+		Path temporary = Files.createTempFile(commitFile.getParent(), "currentCommit", ".tmp");
+		try {
+			Files.writeString(temporary, json.toString(), StandardCharsets.UTF_8);
+			moveReplacing(temporary, commitFile);
+		} finally {
+			Files.deleteIfExists(temporary);
+		}
 	}
 
 	private String fetchLatestSha() throws IOException, InterruptedException {
@@ -122,25 +133,124 @@ public final class RepoDownloader {
 	}
 
 	/**
-	 * Downloads and extracts the given sha's archive over the shared repo folder, then
-	 * records it in currentCommit.json. Safe to call from a background thread.
+	 * Downloads and extracts the given sha into a staging directory, validates it, then
+	 * transactionally replaces the shared repo and records it in currentCommit.json.
+	 * Safe to call from a background thread.
 	 *
 	 * @return true on success
 	 */
 	public boolean downloadAndApply(String sha) {
+		Path zip = null;
 		try {
+			prepareUpdateDirectories();
 			String downloadUrl = "https://github.com/" + OWNER + "/" + REPO + "/archive/" + sha + ".zip";
 			logger.info("Downloading SkyBlock item repo (-> {})", sha);
-			Path zip = downloadArchive(downloadUrl);
-			deleteRecursively(repoDir);
-			extract(zip, repoDir);
-			Files.deleteIfExists(zip);
-			saveSha(sha);
+			zip = downloadArchive(downloadUrl);
+			extract(zip, stagingDir);
+			validateStagedRepository();
+			installStagedRepository(sha);
 			logger.info("SkyBlock item repo updated to {}.", sha);
 			return true;
 		} catch (Exception e) {
-			logger.error("Failed to download/extract SkyBlock item repo", e);
+			logger.error("Failed to prepare/install SkyBlock item repo; any previous repo remains recoverable.", e);
 			return false;
+		} finally {
+			deleteQuietly(zip);
+			if (Files.exists(repoDir)) {
+				deleteQuietly(stagingDir);
+			} else if (Files.exists(stagingDir)) {
+				logger.warn("Keeping staged repository at {} because no live repo is currently present.", stagingDir);
+			}
+		}
+	}
+
+	private void prepareUpdateDirectories() throws IOException {
+		Files.createDirectories(repoDir.getParent());
+		if (!Files.exists(repoDir) && Files.exists(backupDir)) {
+			moveDirectory(backupDir, repoDir);
+		}
+		if (Files.exists(repoDir)) {
+			deleteRecursively(backupDir);
+		}
+		deleteRecursively(stagingDir);
+	}
+
+	private void validateStagedRepository() throws IOException {
+		Path items = stagingDir.resolve("items");
+		Path constants = stagingDir.resolve("constants");
+		if (!Files.isDirectory(items) || !Files.isDirectory(constants)) {
+			throw new IOException("Downloaded repository is missing its items or constants directory");
+		}
+		try (var files = Files.list(items)) {
+			if (files.noneMatch(Files::isRegularFile)) {
+				throw new IOException("Downloaded repository contains no item files");
+			}
+		}
+	}
+
+	private void installStagedRepository(String sha) throws IOException {
+		boolean hadPrevious = Files.exists(repoDir);
+		if (hadPrevious) {
+			moveDirectory(repoDir, backupDir);
+		}
+
+		try {
+			moveDirectory(stagingDir, repoDir);
+		} catch (IOException installError) {
+			if (hadPrevious && Files.exists(backupDir) && !Files.exists(repoDir)) {
+				moveDirectory(backupDir, repoDir);
+			}
+			throw installError;
+		}
+
+		try {
+			saveSha(sha);
+		} catch (IOException markerError) {
+			if (hadPrevious && Files.exists(backupDir)) {
+				try {
+					moveDirectory(repoDir, stagingDir);
+					try {
+						moveDirectory(backupDir, repoDir);
+					} catch (IOException restoreError) {
+						markerError.addSuppressed(restoreError);
+						try {
+							moveDirectory(stagingDir, repoDir);
+						} catch (IOException reinstallError) {
+							markerError.addSuppressed(reinstallError);
+						}
+					}
+				} catch (IOException rollbackError) {
+					markerError.addSuppressed(rollbackError);
+				}
+			}
+			throw markerError;
+		}
+
+		deleteQuietly(backupDir);
+	}
+
+	private void moveDirectory(Path source, Path target) throws IOException {
+		try {
+			Files.move(source, target, StandardCopyOption.ATOMIC_MOVE);
+		} catch (AtomicMoveNotSupportedException e) {
+			Files.move(source, target);
+		}
+	}
+
+	private void moveReplacing(Path source, Path target) throws IOException {
+		try {
+			Files.move(source, target, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
+		} catch (AtomicMoveNotSupportedException e) {
+			Files.move(source, target, StandardCopyOption.REPLACE_EXISTING);
+		}
+	}
+
+	private void deleteQuietly(Path path) {
+		if (path == null) return;
+		try {
+			deleteRecursively(path);
+		} catch (IOException e) {
+			logger.warn("Could not clean up temporary repository path {} ({}).", path, e.toString());
 		}
 	}
 
@@ -185,12 +295,9 @@ public final class RepoDownloader {
 	private void deleteRecursively(Path dir) throws IOException {
 		if (!Files.exists(dir)) return;
 		try (var walk = Files.walk(dir)) {
-			walk.sorted((a, b) -> b.compareTo(a)).forEach(p -> {
-				try {
-					Files.deleteIfExists(p);
-				} catch (IOException ignored) {
-				}
-			});
+			for (Path path : walk.sorted((a, b) -> b.compareTo(a)).toList()) {
+				Files.deleteIfExists(path);
+			}
 		}
 	}
 }
