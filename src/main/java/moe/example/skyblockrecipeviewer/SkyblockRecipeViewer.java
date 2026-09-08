@@ -1,0 +1,94 @@
+package moe.example.skyblockrecipeviewer;
+
+import net.fabricmc.api.ClientModInitializer;
+import net.fabricmc.fabric.api.client.networking.v1.ClientPlayConnectionEvents;
+import net.minecraft.network.chat.Component;
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
+
+import moe.example.skyblockrecipeviewer.repo.HypixelSkinManager;
+import moe.example.skyblockrecipeviewer.repo.NeuRepoManager;
+
+/**
+ * Client entrypoint.
+ *
+ * Deliberately does NOT:
+ *  - check GitHub (or anywhere else) for newer releases of this mod
+ *  - send the list of installed mods to any server on join
+ *
+ * The only network calls this mod makes are:
+ *  - checking/fetching the public, community-maintained NotEnoughUpdates-REPO item data
+ *  - fetching Hypixel's own public api.hypixel.net/v2/resources/skyblock/items endpoint,
+ *    used only for its skull texture ("skin") data - no API key, no account data involved
+ * and both only happen when actually connecting to Hypixel, not on every server join.
+ */
+public class SkyblockRecipeViewer implements ClientModInitializer {
+	public static final String MOD_ID = "skyblockrecipeviewer";
+	public static final Logger LOGGER = LogManager.getLogger("SkyblockRecipeViewer");
+
+	@Override
+	public void onInitializeClient() {
+		moe.example.skyblockrecipeviewer.rei.SkyblockPriceTooltipHandler.register();
+		moe.example.skyblockrecipeviewer.rei.SkyblockItemRenameTooltipHandler.register();
+		moe.example.skyblockrecipeviewer.command.SkyblockCommands.register();
+
+		// Loads whatever's already on disk (no network) so REI's plugin-load phase - which
+		// happens at game launch, before any server is joined - has recipes ready
+		// immediately from the second launch onward.
+		NeuRepoManager.getInstance().loadAsync();
+		HypixelSkinManager.getInstance().ensureLoaded();
+
+		ClientPlayConnectionEvents.JOIN.register((handler, sender, client) -> {
+			var server = client.getCurrentServer();
+			if (server == null || server.ip == null || !server.ip.toLowerCase().contains("hypixel.net")) {
+				return;
+			}
+			var repoUpdate = NeuRepoManager.getInstance().checkForUpdatesOnJoin();
+			repoUpdate.thenAccept(updated -> {
+				if (!updated) return;
+				LOGGER.info("SkyBlock item repo updated from GitHub.");
+				client.execute(() -> {
+					if (client.player != null) {
+						client.player.sendSystemMessage(Component.literal(
+							"[SkyBlock Recipe Viewer] Item repo updated - the item list will refresh "
+								+ "automatically, but recipe displays need a manual reload (Mod Menu -> "
+								+ "REI -> Reload Plugins) or restart to pick up new/changed recipes."));
+					}
+				});
+			});
+			// Hypixel's item resource doesn't have a commit-sha/version marker like the NEU
+			// repo does, so there's nothing cheap to compare against - just re-fetch it
+			// outright once per Hypixel connection, same cadence as the repo update check.
+			var skinRefresh = HypixelSkinManager.getInstance().refreshFromNetwork();
+
+			// This is the piece that makes a straight multiplayer join actually show items
+			// without requiring an unrelated reload (e.g. loading into singleplayer) first -
+			// checkForUpdatesOnJoin/refreshFromNetwork update the underlying data, but don't
+			// know anything about REI themselves. See SkyblockReiPlugin.tryLivePush's javadoc.
+			java.util.concurrent.CompletableFuture.allOf(repoUpdate, skinRefresh)
+				.thenRun(() -> client.execute(moe.example.skyblockrecipeviewer.rei.SkyblockReiPlugin::tryLivePush));
+
+			// Failsafe: 30s after join, unconditionally re-run the whole thing again,
+			// regardless of whether the immediate attempt above already succeeded. Covers
+			// anything that could've silently fallen through the cracks - a slow/flaky
+			// download that hadn't finished by the time REI's plugin reload originally ran,
+			// another SkyBlock mod (see NeuRepoManager.KNOWN_REPO_MANAGERS) populating the
+			// shared repo folder a little later than our own check, or any other transient
+			// timing issue. Each piece is already cheap/idempotent when there's nothing new
+			// to do (checkForUpdatesOnJoin no-ops if the sha's unchanged, tryLivePush no-ops
+			// if the loaded repo reference hasn't changed since the last push), so this is
+			// safe to fire unconditionally rather than trying to track whether it's "needed".
+			java.util.concurrent.CompletableFuture.delayedExecutor(30, java.util.concurrent.TimeUnit.SECONDS)
+				.execute(() -> {
+					LOGGER.info("30s post-join failsafe: re-checking SkyBlock item repo/skin data.");
+					var retryRepo = NeuRepoManager.getInstance().checkForUpdatesOnJoin();
+					var retrySkin = HypixelSkinManager.getInstance().refreshFromNetwork();
+					java.util.concurrent.CompletableFuture.allOf(retryRepo, retrySkin)
+						.thenRun(() -> client.execute(
+							moe.example.skyblockrecipeviewer.rei.SkyblockReiPlugin::tryLivePush));
+				});
+		});
+
+		LOGGER.info("SkyBlock Recipe Viewer loaded.");
+	}
+}
