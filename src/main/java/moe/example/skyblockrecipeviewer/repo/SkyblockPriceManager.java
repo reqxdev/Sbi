@@ -47,8 +47,8 @@ import java.util.concurrent.TimeUnit;
  *    order book in one request. Parsed directly from the order-book arrays rather than
  *    "quick_status", per real in-game verification: "sell_summary" is actually the BUY ORDER
  *    book, "buy_summary" is actually the SELL OFFER book (swapped from what the names suggest).
- *    The lowest "pricePerUnit" in each is used - sell_summary's lowest is what a player
- *    receives instantly selling; buy_summary's lowest is what a player pays instantly buying.
+ *    The highest sell_summary price is what a player receives instantly selling; the lowest
+ *    buy_summary price is what a player pays instantly buying.
  *  - Auction House (lowest BIN): Coflnet's public {@code /api/prices/neu} endpoint - confirmed
  *    directly against its real output - is a flat {@code {itemId: lowestBinPrice}} map covering
  *    every priceable item at once, no rate limit, no API key.
@@ -61,10 +61,10 @@ public final class SkyblockPriceManager {
 	private static final long REFRESH_INTERVAL_MINUTES = 5;
 	private static final long MAX_PRICE_RESPONSE_BYTES = 32L * 1024 * 1024;
 
-	private static final Path BAZAAR_CACHE_FILE = FabricLoader.getInstance().getConfigDir()
-		.resolve("skyblockrecipeviewer").resolve("bazaar-prices-cache.json");
-	private static final Path AUCTION_CACHE_FILE = FabricLoader.getInstance().getConfigDir()
-		.resolve("skyblockrecipeviewer").resolve("auction-prices-cache.json");
+	private static final Path BAZAAR_CACHE_FILE = FabricLoader.getInstance().getGameDir()
+		.resolve("skyblockrecipeviewer-bazaar-prices.json");
+	private static final Path AUCTION_CACHE_FILE = FabricLoader.getInstance().getGameDir()
+		.resolve("skyblockrecipeviewer-auction-prices.json");
 	private static final SkyblockPriceManager INSTANCE = new SkyblockPriceManager();
 
 	public static SkyblockPriceManager getInstance() {
@@ -131,50 +131,17 @@ public final class SkyblockPriceManager {
 		return Optional.ofNullable(auctionLowestBin.get(skyblockId));
 	}
 
-	// ---- Disk cache: same plain-Gson-JsonObject pattern as SkyblockItemCache/HypixelSkinManager ----
+	// ---- Disk cache ----
 
 	private void loadBazaarCacheFromDisk() {
 		try {
 			if (!Files.exists(BAZAAR_CACHE_FILE)) return;
 			JsonObject root = JsonParser.parseString(Files.readString(BAZAAR_CACHE_FILE, StandardCharsets.UTF_8))
 				.getAsJsonObject();
-			if (!root.has("prices")) return;
-			JsonObject prices = root.getAsJsonObject("prices");
-			Map<String, BazaarPrice> loaded = new HashMap<>();
-			int count = 0;
-			for (String itemId : prices.keySet()) {
-				try {
-					JsonObject entry = prices.getAsJsonObject(itemId);
-					double buy = entry.has("buy") ? entry.get("buy").getAsDouble() : Double.NaN;
-					double sell = entry.has("sell") ? entry.get("sell").getAsDouble() : Double.NaN;
-					loaded.put(itemId, new BazaarPrice(buy, sell));
-					count++;
-				} catch (Exception perItem) {
-					LOGGER.warn("Skipping corrupt cached Bazaar entry for {} ({}).", itemId, perItem.toString());
-				}
-			}
-			bazaarPrices = Map.copyOf(loaded);
-			LOGGER.info("Loaded {} Bazaar prices from local cache (pending live refresh).", count);
+			bazaarPrices = readBazaarPrices(root);
+			LOGGER.info("Loaded {} Bazaar prices from {} (pending live refresh).", bazaarPrices.size(), BAZAAR_CACHE_FILE);
 		} catch (Exception e) {
 			LOGGER.warn("Could not read local Bazaar price cache ({}).", e.toString());
-		}
-	}
-
-	private void writeBazaarCacheToDisk() {
-		try {
-			JsonObject root = new JsonObject();
-			JsonObject prices = new JsonObject();
-			for (Map.Entry<String, BazaarPrice> entry : bazaarPrices.entrySet()) {
-				JsonObject value = new JsonObject();
-				if (!Double.isNaN(entry.getValue().instantBuyPrice())) value.addProperty("buy", entry.getValue().instantBuyPrice());
-				if (!Double.isNaN(entry.getValue().instantSellPrice())) value.addProperty("sell", entry.getValue().instantSellPrice());
-				prices.add(entry.getKey(), value);
-			}
-			root.add("prices", prices);
-			Files.createDirectories(BAZAAR_CACHE_FILE.getParent());
-			Files.writeString(BAZAAR_CACHE_FILE, root.toString(), StandardCharsets.UTF_8);
-		} catch (Exception e) {
-			LOGGER.error("Failed to write local Bazaar price cache.", e);
 		}
 	}
 
@@ -183,36 +150,62 @@ public final class SkyblockPriceManager {
 			if (!Files.exists(AUCTION_CACHE_FILE)) return;
 			JsonObject root = JsonParser.parseString(Files.readString(AUCTION_CACHE_FILE, StandardCharsets.UTF_8))
 				.getAsJsonObject();
-			if (!root.has("prices")) return;
-			JsonObject prices = root.getAsJsonObject("prices");
-			Map<String, Double> loaded = new HashMap<>();
-			int count = 0;
-			for (String itemId : prices.keySet()) {
-				try {
-					JsonElement value = prices.get(itemId);
-					if (!value.isJsonPrimitive()) continue;
-					loaded.put(itemId, value.getAsDouble());
-					count++;
-				} catch (Exception perItem) {
-					LOGGER.warn("Skipping corrupt cached auction entry for {} ({}).", itemId, perItem.toString());
-				}
-			}
-			auctionLowestBin = Map.copyOf(loaded);
-			LOGGER.info("Loaded {} Auction House lowest-BIN prices from local cache (pending live refresh).", count);
+			auctionLowestBin = readAuctionPrices(root);
+			LOGGER.info("Loaded {} Auction House prices from {} (pending live refresh).", auctionLowestBin.size(), AUCTION_CACHE_FILE);
 		} catch (Exception e) {
 			LOGGER.warn("Could not read local Auction House price cache ({}).", e.toString());
+		}
+	}
+
+	private static Map<String, BazaarPrice> readBazaarPrices(JsonObject prices) {
+		Map<String, BazaarPrice> loaded = new HashMap<>();
+		for (String itemId : prices.keySet()) {
+			try {
+				JsonObject entry = prices.getAsJsonObject(itemId);
+				double buy = entry.has("buy") ? entry.get("buy").getAsDouble() : Double.NaN;
+				double sell = entry.has("sell") ? entry.get("sell").getAsDouble() : Double.NaN;
+				loaded.put(itemId, new BazaarPrice(buy, sell));
+			} catch (Exception perItem) {
+				LOGGER.warn("Skipping corrupt cached Bazaar entry for {} ({}).", itemId, perItem.toString());
+			}
+		}
+		return Map.copyOf(loaded);
+	}
+
+	private static Map<String, Double> readAuctionPrices(JsonObject prices) {
+		Map<String, Double> loaded = new HashMap<>();
+		for (String itemId : prices.keySet()) {
+			try {
+				JsonElement value = prices.get(itemId);
+				if (value.isJsonPrimitive()) loaded.put(itemId, value.getAsDouble());
+			} catch (Exception perItem) {
+				LOGGER.warn("Skipping corrupt cached auction entry for {} ({}).", itemId, perItem.toString());
+			}
+		}
+		return Map.copyOf(loaded);
+	}
+
+	private void writeBazaarCacheToDisk() {
+		try {
+			JsonObject root = new JsonObject();
+			for (Map.Entry<String, BazaarPrice> entry : bazaarPrices.entrySet()) {
+				JsonObject value = new JsonObject();
+				if (!Double.isNaN(entry.getValue().instantBuyPrice())) value.addProperty("buy", entry.getValue().instantBuyPrice());
+				if (!Double.isNaN(entry.getValue().instantSellPrice())) value.addProperty("sell", entry.getValue().instantSellPrice());
+				root.add(entry.getKey(), value);
+			}
+			Files.writeString(BAZAAR_CACHE_FILE, root.toString(), StandardCharsets.UTF_8);
+		} catch (Exception e) {
+			LOGGER.error("Failed to write local Bazaar price cache.", e);
 		}
 	}
 
 	private void writeAuctionCacheToDisk() {
 		try {
 			JsonObject root = new JsonObject();
-			JsonObject prices = new JsonObject();
 			for (Map.Entry<String, Double> entry : auctionLowestBin.entrySet()) {
-				prices.addProperty(entry.getKey(), entry.getValue());
+				root.addProperty(entry.getKey(), entry.getValue());
 			}
-			root.add("prices", prices);
-			Files.createDirectories(AUCTION_CACHE_FILE.getParent());
 			Files.writeString(AUCTION_CACHE_FILE, root.toString(), StandardCharsets.UTF_8);
 		} catch (Exception e) {
 			LOGGER.error("Failed to write local Auction House price cache.", e);
@@ -284,9 +277,8 @@ public final class SkyblockPriceManager {
 			try {
 				JsonObject product = products.getAsJsonObject(itemId);
 				// sell_summary = the BUY ORDER book (what a player receives instantly selling);
-				// buy_summary = the SELL OFFER book (what a player pays instantly buying) - see
-				// class docs, confirmed against real in-game labels, not assumed from names.
-				double instantSellPrice = lowestPricePerUnit(product, "sell_summary");
+				// buy_summary = the SELL OFFER book (what a player pays instantly buying).
+				double instantSellPrice = highestPricePerUnit(product, "sell_summary");
 				double instantBuyPrice = lowestPricePerUnit(product, "buy_summary");
 				if (Double.isNaN(instantBuyPrice) && Double.isNaN(instantSellPrice)) continue;
 				refreshed.put(itemId, new BazaarPrice(instantBuyPrice, instantSellPrice));
@@ -312,5 +304,18 @@ public final class SkyblockPriceManager {
 			if (Double.isNaN(lowest) || price < lowest) lowest = price;
 		}
 		return lowest;
+	}
+
+	private static double highestPricePerUnit(JsonObject product, String arrayKey) {
+		if (!product.has(arrayKey)) return Double.NaN;
+		JsonArray array = product.getAsJsonArray(arrayKey);
+		double highest = Double.NaN;
+		for (JsonElement element : array) {
+			JsonObject entry = element.getAsJsonObject();
+			if (!entry.has("pricePerUnit")) continue;
+			double price = entry.get("pricePerUnit").getAsDouble();
+			if (Double.isNaN(highest) || price > highest) highest = price;
+		}
+		return highest;
 	}
 }
