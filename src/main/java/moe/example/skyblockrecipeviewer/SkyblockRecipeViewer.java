@@ -2,6 +2,7 @@ package moe.example.skyblockrecipeviewer;
 
 import net.fabricmc.api.ClientModInitializer;
 import net.fabricmc.fabric.api.client.networking.v1.ClientPlayConnectionEvents;
+import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
 import net.minecraft.network.chat.Component;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
@@ -35,6 +36,8 @@ public class SkyblockRecipeViewer implements ClientModInitializer {
 		// Prepare all local REI data as early as Minecraft's registries safely allow. This never
 		// blocks client startup or performs network I/O; network refreshes remain join-driven.
 		moe.example.skyblockrecipeviewer.rei.SkyblockReiPlugin.startBootstrap();
+		ClientTickEvents.END_CLIENT_TICK.register(client ->
+			moe.example.skyblockrecipeviewer.rei.SkyblockReiPlugin.processPendingItemCache());
 
 		ClientPlayConnectionEvents.JOIN.register((handler, sender, client) -> {
 			var server = client.getCurrentServer();
@@ -64,7 +67,7 @@ public class SkyblockRecipeViewer implements ClientModInitializer {
 			// checkForUpdatesOnJoin/refreshFromNetwork update the underlying data, but don't
 			// know anything about REI themselves. See SkyblockReiPlugin.tryLivePush's javadoc.
 			java.util.concurrent.CompletableFuture.allOf(repoUpdate, skinRefresh)
-				.thenRun(moe.example.skyblockrecipeviewer.rei.SkyblockReiPlugin::tryLivePush);
+				.thenRun(() -> client.execute(moe.example.skyblockrecipeviewer.rei.SkyblockReiPlugin::tryLivePush));
 
 			// Failsafe: 30s after join, unconditionally re-run the whole thing again,
 			// regardless of whether the immediate attempt above already succeeded. Covers
@@ -82,7 +85,7 @@ public class SkyblockRecipeViewer implements ClientModInitializer {
 					var retryRepo = NeuRepoManager.getInstance().checkForUpdatesOnJoin();
 					var retrySkin = HypixelSkinManager.getInstance().refreshFromNetwork();
 					java.util.concurrent.CompletableFuture.allOf(retryRepo, retrySkin)
-						.thenRun(moe.example.skyblockrecipeviewer.rei.SkyblockReiPlugin::tryLivePush);
+						.thenRun(() -> client.execute(moe.example.skyblockrecipeviewer.rei.SkyblockReiPlugin::tryLivePush));
 				});
 		});
 

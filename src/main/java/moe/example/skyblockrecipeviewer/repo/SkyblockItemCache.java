@@ -49,6 +49,9 @@ public final class SkyblockItemCache {
 	private SkyblockItemCache() {
 	}
 
+	public record CachedStack(String skyblockId, String snbt) {
+	}
+
 	/**
 	 * @return the repo commit sha currently recorded in currentCommit.json, or null if that
 	 * file doesn't exist yet (repo never downloaded by anything) or fails to parse.
@@ -127,6 +130,36 @@ public final class SkyblockItemCache {
 		return result;
 	}
 
+	public static java.util.List<CachedStack> readCachedStacks() {
+		java.util.List<CachedStack> result = new java.util.ArrayList<>();
+		try {
+			if (!Files.exists(CACHE_FILE)) return result;
+			JsonObject root = JsonParser.parseString(Files.readString(CACHE_FILE, StandardCharsets.UTF_8))
+				.getAsJsonObject();
+			if (!root.has("items")) return result;
+			for (String skyblockId : root.getAsJsonObject("items").keySet()) {
+				result.add(new CachedStack(skyblockId, root.getAsJsonObject("items").get(skyblockId).getAsString()));
+			}
+		} catch (Exception e) {
+			LOGGER.warn("Could not read local resolved-item cache ({}).", e.toString());
+		}
+		return result;
+	}
+
+	public static ItemStack decodeCachedStack(CachedStack cached) {
+		try {
+			CompoundTag tag = TagParser.parseCompoundFully(cached.snbt());
+			ItemStack stack = ItemStack.CODEC.parse(SkyblockNbtApplier.registryOps(), tag)
+				.resultOrPartial(error -> LOGGER.warn("Skipping cached stack for {} - failed to parse: {}", cached.skyblockId(), error))
+				.orElse(ItemStack.EMPTY);
+			if (!stack.isEmpty()) SkyblockItemResolver.primeCache(cached.skyblockId(), stack);
+			return stack;
+		} catch (Exception e) {
+			LOGGER.warn("Skipping corrupt cached stack for {} ({}).", cached.skyblockId(), e.toString());
+			return ItemStack.EMPTY;
+		}
+	}
+
 	/**
 	 * Overwrites the on-disk cache with every given stack, tagged to {@code repoSha}. Meant to
 	 * be called only after actually resolving fresh data from a repo isStale() found to be
@@ -135,10 +168,15 @@ public final class SkyblockItemCache {
 	 * the cached item DATA still matches what's on disk.
 	 */
 	public static void write(String repoSha, Map<String, ItemStack> resolvedStacks) {
+		String serialized = serialize(repoSha, resolvedStacks);
+		if (serialized != null) writeSerialized(serialized);
+	}
+
+	public static String serialize(String repoSha, Map<String, ItemStack> resolvedStacks) {
 		if (repoSha == null) {
 			LOGGER.warn("Not writing the SkyBlock item cache - the current repo commit sha is "
 				+ "unknown, so a future launch could never tell this cache apart from a stale one.");
-			return;
+			return null;
 		}
 		try {
 			JsonObject root = new JsonObject();
@@ -154,10 +192,19 @@ public final class SkyblockItemCache {
 				items.addProperty(entry.getKey(), encoded.get().toString());
 			}
 			root.add("items", items);
-			Files.createDirectories(CACHE_FILE.getParent());
-			Files.writeString(CACHE_FILE, root.toString(), StandardCharsets.UTF_8);
-			LOGGER.info("Wrote {} resolved SkyBlock item(s) to the local cache (repo {}).",
+			LOGGER.info("Prepared {} resolved SkyBlock item(s) for the local cache (repo {}).",
 				items.size(), repoSha);
+			return root.toString();
+		} catch (Exception e) {
+			LOGGER.error("Failed to prepare the local resolved-item cache.", e);
+			return null;
+		}
+	}
+
+	public static void writeSerialized(String serialized) {
+		try {
+			Files.createDirectories(CACHE_FILE.getParent());
+			Files.writeString(CACHE_FILE, serialized, StandardCharsets.UTF_8);
 		} catch (Exception e) {
 			LOGGER.error("Failed to write the local resolved-item cache.", e);
 		}
