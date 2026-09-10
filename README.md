@@ -5,12 +5,12 @@ This is not a re-creation of Firmament just some of its features without snitchi
 This project was created entirely by AI
 
 # Dependencies
-MC 26.2
-Fabric Loader 0.19.3+
-FabricAPI
+-MC 26.2
+-Fabric Loader 0.19.3+
+-FabricAPI
 
 # Credits
-MGHusky - The person who originally created this project
-https://github.com/NotEnoughUpdates/NotEnoughUpdates-REPO 
-https://github.com/shedaniel/RoughlyEnoughItems
-https://github.com/FirmamentMC/Firmament
+-MGHusky - The person who originally created this project
+-https://github.com/NotEnoughUpdates/NotEnoughUpdates-REPO 
+-https://github.com/shedaniel/RoughlyEnoughItems
+-https://github.com/FirmamentMC/Firmament
