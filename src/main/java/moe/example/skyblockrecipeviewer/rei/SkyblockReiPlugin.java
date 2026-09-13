@@ -58,6 +58,7 @@ public class SkyblockReiPlugin implements REIClientPlugin {
 	private static volatile boolean reiPluginsRegistered = false;
 
 	private static volatile List<ItemStack> preparedItemStacks = List.of();
+	private static volatile NEURepository preparedItemStacksRepo;
 	private static volatile CompletableFuture<Void> bootstrapFuture;
 	private static final ExecutorService ITEM_RESOLVE_EXECUTOR = Executors.newSingleThreadExecutor(r -> {
 		Thread thread = new Thread(r, "skyblock-rei-resolver");
@@ -69,6 +70,18 @@ public class SkyblockReiPlugin implements REIClientPlugin {
 	private static int pendingCacheIndex = 0;
 	private static final List<ItemStack> decodedCachedStacks = new ArrayList<>();
 	private static boolean cacheReadComplete = false;
+	private static NEURepository pendingCacheRepo;
+	private static volatile NEURepository repoAwaitingReiRefresh;
+	private static volatile NEURepository reiRefreshPendingRepo;
+	private static volatile NEURepository reiRefreshRunningRepo;
+	private static volatile boolean reiRefreshObserved;
+	private static volatile int reiRefreshStartTick;
+	private static volatile boolean reiRefreshEndStage;
+	private static int clientTick;
+
+	private record CachedItemLoad(NEURepository repository,
+			List<SkyblockItemCache.CachedStack> stacks) {
+	}
 
 	public static synchronized CompletableFuture<Void> startBootstrap() {
 		if (bootstrapFuture != null) return bootstrapFuture;
@@ -86,13 +99,20 @@ public class SkyblockReiPlugin implements REIClientPlugin {
 				return;
 			}
 			SkyblockRecipeViewer.LOGGER.info("SkyBlock REI data bootstrap completed.");
-			CompletableFuture.supplyAsync(SkyblockItemCache::readCachedStacks, ITEM_RESOLVE_EXECUTOR)
-				.thenAccept(cached -> net.minecraft.client.Minecraft.getInstance().execute(() -> {
-					pendingCachedStacks = cached;
+			CompletableFuture.supplyAsync(() -> {
+				NEURepository repository = manager.getLoadedRepoOrNull();
+				boolean current = repository != null
+					&& !SkyblockItemCache.isStale(manager.getLoadedRevisionKey());
+				return new CachedItemLoad(repository,
+					current ? SkyblockItemCache.readCachedStacks() : List.of());
+			}, ITEM_RESOLVE_EXECUTOR).thenAccept(cached ->
+				net.minecraft.client.Minecraft.getInstance().execute(() -> {
+					pendingCachedStacks = cached.stacks();
+					pendingCacheRepo = cached.repository();
 					pendingCacheIndex = 0;
 					decodedCachedStacks.clear();
 					cacheReadComplete = true;
-					if (cached.isEmpty()) tryLivePush();
+					if (cached.stacks().isEmpty()) tryLivePush();
 				}));
 			net.minecraft.client.Minecraft.getInstance().execute(SkyblockReiPlugin::tryLivePush);
 		});
@@ -102,6 +122,7 @@ public class SkyblockReiPlugin implements REIClientPlugin {
 	@Override
 	public void registerCategories(CategoryRegistry registry) {
 		reiPluginsRegistered = true;
+		if (reiRefreshRunningRepo != null) reiRefreshObserved = true;
 		// Redundant safety net, not the primary call site anymore - registerEntries()
 		// (which runs before this every reload) now calls this first, since it's the one
 		// that actually needs SkyblockItemEntryDefinition.TYPE to exist already. Harmless to
@@ -244,6 +265,12 @@ public class SkyblockReiPlugin implements REIClientPlugin {
 	public static void processPendingItemCache() {
 		if (pendingCachedStacks.isEmpty() || pendingCacheIndex >= pendingCachedStacks.size()) return;
 		if (net.minecraft.client.Minecraft.getInstance().getConnection() == null || !reiPluginsRegistered) return;
+		if (pendingCacheRepo != NeuRepoManager.getInstance().getLoadedRepoOrNull()) {
+			pendingCachedStacks = List.of();
+			decodedCachedStacks.clear();
+			tryLivePush();
+			return;
+		}
 		int end = Math.min(pendingCacheIndex + 100, pendingCachedStacks.size());
 		for (; pendingCacheIndex < end; pendingCacheIndex++) {
 			ItemStack stack = SkyblockItemCache.decodeCachedStack(pendingCachedStacks.get(pendingCacheIndex));
@@ -251,7 +278,9 @@ public class SkyblockReiPlugin implements REIClientPlugin {
 		}
 		if (pendingCacheIndex < pendingCachedStacks.size()) return;
 		preparedItemStacks = List.copyOf(decodedCachedStacks);
+		preparedItemStacksRepo = pendingCacheRepo;
 		pendingCachedStacks = List.of();
+		pendingCacheRepo = null;
 		decodedCachedStacks.clear();
 		SkyblockRecipeViewer.LOGGER.info("Loaded {} SkyBlock item(s) from the local resolved-item cache.", preparedItemStacks.size());
 		if (reiPluginsRegistered && !preparedItemStacks.isEmpty()) {
@@ -261,6 +290,20 @@ public class SkyblockReiPlugin implements REIClientPlugin {
 			registry.refilter();
 		}
 		tryLivePush();
+	}
+
+	public static void onRepositoryReloaded() {
+		net.minecraft.client.Minecraft.getInstance().execute(() -> {
+			NEURepository repository = NeuRepoManager.getInstance().getLoadedRepoOrNull();
+			if (repository == null) return;
+			SkyblockItemResolver.invalidateCache(repository);
+			pendingCachedStacks = List.of();
+			pendingCacheRepo = null;
+			decodedCachedStacks.clear();
+			cacheReadComplete = true;
+			repoAwaitingReiRefresh = repository;
+			tryLivePushOnClient();
+		});
 	}
 
 	private static void tryLivePushOnClient() {
@@ -299,7 +342,7 @@ public class SkyblockReiPlugin implements REIClientPlugin {
 		NEURepository loaded = manager.getLoadedRepoOrNull();
 		if (loaded == null) return;
 		synchronized (pushLock) {
-			if (livePushInProgress || (!preparedItemStacks.isEmpty() && !SkyblockItemCache.isStale())
+			if (livePushInProgress || (loaded == preparedItemStacksRepo && !preparedItemStacks.isEmpty())
 				|| (loaded == lastLivePushedRepo && !preparedItemStacks.isEmpty())) return;
 			livePushInProgress = true;
 		}
@@ -318,27 +361,85 @@ public class SkyblockReiPlugin implements REIClientPlugin {
 			SkyblockRecipeViewer.LOGGER.error("Preparing SkyBlock REI entries failed.", error);
 			return;
 		}
+		if (NeuRepoManager.getInstance().getLoadedRepoOrNull() != loaded) {
+			SkyblockItemResolver.invalidateCache(
+				NeuRepoManager.getInstance().getLoadedRepoOrNull());
+			tryLivePush();
+			return;
+		}
 		if (net.minecraft.client.Minecraft.getInstance().getConnection() == null || !reiPluginsRegistered) return;
 		preparedItemStacks = resolvedStacks;
-		SkyblockItemEntryDefinition.registerType();
-		EntryRegistry registry = EntryRegistry.getInstance();
-		List<EntryStack<ItemStack>> entries = new ArrayList<>(resolvedStacks.size());
-		for (ItemStack stack : resolvedStacks) {
-			if (!stack.isEmpty()) entries.add(EntryStack.of(SkyblockItemEntryDefinition.TYPE, stack));
+		preparedItemStacksRepo = loaded;
+		boolean refreshRecipes = repoAwaitingReiRefresh == loaded;
+		if (refreshRecipes) {
+			repoAwaitingReiRefresh = null;
+			reiRefreshPendingRepo = loaded;
 		}
-		registry.addEntries(entries);
-		registry.refilter();
+		SkyblockItemEntryDefinition.registerType();
+		if (!refreshRecipes) {
+			EntryRegistry registry = EntryRegistry.getInstance();
+			List<EntryStack<ItemStack>> entries = new ArrayList<>(resolvedStacks.size());
+			for (ItemStack stack : resolvedStacks) {
+				if (!stack.isEmpty()) entries.add(EntryStack.of(SkyblockItemEntryDefinition.TYPE, stack));
+			}
+			registry.addEntries(entries);
+			registry.refilter();
+			SkyblockRecipeViewer.LOGGER.info(
+				"Registered {} SkyBlock item entries in REI as one batch.", entries.size());
+		}
 		synchronized (pushLock) {
 			lastLivePushedRepo = loaded;
 		}
-		SkyblockRecipeViewer.LOGGER.info("Registered {} SkyBlock item entries in REI as one batch.", entries.size());
 		String repoSha = SkyblockItemCache.currentRepoSha();
 		Map<String, ItemStack> snapshot = SkyblockItemResolver.snapshotResolvedCache();
-		String cacheJson = SkyblockItemCache.serialize(repoSha, snapshot);
+		String cacheJson = SkyblockItemCache.serialize(repoSha,
+			NeuRepoManager.getInstance().getLoadedRevisionKey(), snapshot);
 		if (cacheJson != null) {
 			CompletableFuture.runAsync(() -> SkyblockItemCache.writeSerialized(cacheJson), ITEM_RESOLVE_EXECUTOR);
 		}
 		CompletableFuture.runAsync(SkullTextureCache::flush, ITEM_RESOLVE_EXECUTOR);
+	}
+
+	public static void processPendingReiRefresh() {
+		clientTick++;
+		if (reiRefreshRunningRepo != null) {
+			if (isReiReloading()) {
+				reiRefreshObserved = true;
+				return;
+			}
+			if (!reiRefreshObserved && clientTick - reiRefreshStartTick < 2) return;
+			if (!reiRefreshEndStage) {
+				reiRefreshEndStage = true;
+				reiRefreshObserved = false;
+				reiRefreshStartTick = clientTick;
+				me.shedaniel.rei.RoughlyEnoughItemsCoreClient.reloadPlugins(null,
+					me.shedaniel.rei.api.common.registry.ReloadStage.END);
+				return;
+			}
+			NEURepository refreshed = reiRefreshRunningRepo;
+			reiRefreshRunningRepo = null;
+			SkyblockRecipeViewer.LOGGER.info("REI refreshed for repository revision {}.",
+				NeuRepoManager.getInstance().getLoadedRevisionKey());
+			if (reiRefreshPendingRepo == refreshed) reiRefreshPendingRepo = null;
+		}
+
+		NEURepository pending = reiRefreshPendingRepo;
+		if (pending == null || pending != NeuRepoManager.getInstance().getLoadedRepoOrNull()) return;
+		var minecraft = net.minecraft.client.Minecraft.getInstance();
+		if (minecraft.level == null || !reiPluginsRegistered || isReiReloading()) return;
+
+		reiRefreshRunningRepo = pending;
+		reiRefreshObserved = false;
+		reiRefreshEndStage = false;
+		reiRefreshStartTick = clientTick;
+		SkyblockRecipeViewer.LOGGER.info("Refreshing REI after repository recipes were rebuilt.");
+		me.shedaniel.rei.RoughlyEnoughItemsCoreClient.reloadPlugins(null,
+			me.shedaniel.rei.api.common.registry.ReloadStage.START, minecraft.level.registryAccess());
+	}
+
+	private static boolean isReiReloading() {
+		return me.shedaniel.rei.api.common.plugins.PluginManager.areAnyReloading()
+			|| me.shedaniel.rei.impl.common.plugins.ReloadManagerImpl.countRunningReloadTasks() > 0;
 	}
 
 	/**

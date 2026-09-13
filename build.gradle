@@ -38,6 +38,18 @@ dependencies {
 	// Plain Java library, no Kotlin runtime pulled in.
 	implementation "moe.nea:neurepoparser:${project.neurepoparser_version}"
 	include "moe.nea:neurepoparser:${project.neurepoparser_version}"
+
+	testImplementation "org.junit.jupiter:junit-jupiter:5.10.2"
+	testRuntimeOnly "org.junit.platform:junit-platform-launcher:1.10.2"
+}
+
+test {
+	useJUnitPlatform()
+	def testWorkingDir = layout.buildDirectory.dir("test-work")
+	workingDir testWorkingDir
+	doFirst {
+		testWorkingDir.get().asFile.mkdirs()
+	}
 }
 
 processResources {

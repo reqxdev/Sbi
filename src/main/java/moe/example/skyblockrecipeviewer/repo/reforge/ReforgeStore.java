@@ -88,6 +88,13 @@ public final class ReforgeStore {
 		return byItemType.get().getOrDefault(itemType, List.of());
 	}
 
+	public void invalidate() {
+		all.set(List.of());
+		byReforgeStone.set(Map.of());
+		byInternalName.set(Map.of());
+		byItemType.set(Map.of());
+	}
+
 	/**
 	 * Re-reads both reforge JSON files from {@code repoDir} (the same shared repo folder
 	 * NeuRepoManager downloads/tracks). Cheap and safe to call repeatedly - always replaces the

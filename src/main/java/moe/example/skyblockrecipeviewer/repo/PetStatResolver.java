@@ -65,6 +65,11 @@ public final class PetStatResolver {
 	private PetStatResolver() {
 	}
 
+	public static synchronized void invalidateCache() {
+		petnumsCache = null;
+		petnumsCachedFrom = null;
+	}
+
 	public record PetIdentity(String type, String tier) {
 	}
 

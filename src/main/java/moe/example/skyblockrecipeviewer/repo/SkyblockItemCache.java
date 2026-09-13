@@ -76,12 +76,19 @@ public final class SkyblockItemCache {
 	 * go to re-resolving.
 	 */
 	public static boolean isStale() {
+		return isStale(null);
+	}
+
+	public static boolean isStale(String currentRevision) {
 		String currentSha = currentRepoSha();
 		if (currentSha == null) return true;
 		try {
 			if (!Files.exists(CACHE_FILE)) return true;
 			JsonObject root = JsonParser.parseString(Files.readString(CACHE_FILE, StandardCharsets.UTF_8))
 				.getAsJsonObject();
+			if (currentRevision != null && root.has("repoRevision")) {
+				return !currentRevision.equals(root.get("repoRevision").getAsString());
+			}
 			String cachedSha = root.has("repoSha") ? root.get("repoSha").getAsString() : null;
 			return !currentSha.equals(cachedSha);
 		} catch (Exception e) {
@@ -173,6 +180,11 @@ public final class SkyblockItemCache {
 	}
 
 	public static String serialize(String repoSha, Map<String, ItemStack> resolvedStacks) {
+		return serialize(repoSha, null, resolvedStacks);
+	}
+
+	public static String serialize(String repoSha, String repoRevision,
+			Map<String, ItemStack> resolvedStacks) {
 		if (repoSha == null) {
 			LOGGER.warn("Not writing the SkyBlock item cache - the current repo commit sha is "
 				+ "unknown, so a future launch could never tell this cache apart from a stale one.");
@@ -181,6 +193,7 @@ public final class SkyblockItemCache {
 		try {
 			JsonObject root = new JsonObject();
 			root.addProperty("repoSha", repoSha);
+			if (repoRevision != null) root.addProperty("repoRevision", repoRevision);
 			JsonObject items = new JsonObject();
 			for (Map.Entry<String, ItemStack> entry : resolvedStacks.entrySet()) {
 				ItemStack stack = entry.getValue();

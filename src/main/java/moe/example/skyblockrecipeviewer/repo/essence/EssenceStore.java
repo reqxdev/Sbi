@@ -55,6 +55,11 @@ public final class EssenceStore {
 		return byItem.get().getOrDefault(skyblockId, List.of());
 	}
 
+	public void invalidate() {
+		all.set(List.of());
+		byItem.set(Map.of());
+	}
+
 	public void reload(Path repoDir) {
 		Path file = repoDir.resolve("constants/essencecosts.json");
 		if (!Files.isRegularFile(file)) return;

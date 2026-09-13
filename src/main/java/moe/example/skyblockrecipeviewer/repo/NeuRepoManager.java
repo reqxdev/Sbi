@@ -1,7 +1,12 @@
 package moe.example.skyblockrecipeviewer.repo;
 
+import java.io.IOException;
+import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.attribute.BasicFileAttributes;
+import java.util.Iterator;
 import java.util.List;
+import java.util.Objects;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicReference;
@@ -25,16 +30,14 @@ public final class NeuRepoManager {
 	// GitHub checks on our part. Discovered the hard way - SkyHanni rewrites that folder on
 	// its own schedule, and our mod trying to also write to it at the same time caused a
 	// race where we'd read half-deleted files mid-rewrite and crash.
-	// (Must stay declared above INSTANCE - static fields init in textual order, and
-	// INSTANCE's constructor reads this immediately.)
 	private static final List<String> KNOWN_REPO_MANAGERS = List.of("skyhanni", "notenoughupdates", "firmament");
-
-	private static final NeuRepoManager INSTANCE = new NeuRepoManager();
 
 	private final RepoDownloader downloader;
 	private final boolean weManageRepo;
 	private final AtomicReference<NEURepository> loadedRepo = new AtomicReference<>();
+	private volatile RepoRevision loadedRevision;
 	private CompletableFuture<NEURepository> loadInFlight;
+	private CompletableFuture<Boolean> changeCheckInFlight;
 	private final java.util.concurrent.ExecutorService executor = Executors.newSingleThreadExecutor(r -> {
 		Thread t = new Thread(r, "skyblock-repo-loader");
 		t.setDaemon(true);
@@ -47,10 +50,13 @@ public final class NeuRepoManager {
 		// versioned via config/notenoughupdates/currentCommit.json. We always read from that
 		// shared location; whether we're also allowed to write to it depends on whether
 		// something else already claims that job.
-		Path neuConfigDir = FabricLoader.getInstance().getConfigDir().resolve("notenoughupdates");
-		this.downloader = new RepoDownloader(neuConfigDir, LOGGER);
+		this(FabricLoader.getInstance().getConfigDir().resolve("notenoughupdates"),
+			KNOWN_REPO_MANAGERS.stream().noneMatch(id -> FabricLoader.getInstance().isModLoaded(id)));
+	}
 
-		this.weManageRepo = KNOWN_REPO_MANAGERS.stream().noneMatch(id -> FabricLoader.getInstance().isModLoaded(id));
+	NeuRepoManager(Path neuConfigDir, boolean weManageRepo) {
+		this.downloader = new RepoDownloader(neuConfigDir, LOGGER);
+		this.weManageRepo = weManageRepo;
 		if (!weManageRepo) {
 			LOGGER.info("Detected another installed mod that manages the shared NotEnoughUpdates "
 				+ "item repo - reading it read-only and letting that mod keep it updated instead of "
@@ -59,7 +65,11 @@ public final class NeuRepoManager {
 	}
 
 	public static NeuRepoManager getInstance() {
-		return INSTANCE;
+		return InstanceHolder.INSTANCE;
+	}
+
+	private static final class InstanceHolder {
+		private static final NeuRepoManager INSTANCE = new NeuRepoManager();
 	}
 
 	/**
@@ -107,6 +117,31 @@ public final class NeuRepoManager {
 	}
 
 	/**
+	 * Checks the current shared repo contents without writing to them. The file walk runs on the
+	 * repo executor and is safe to call periodically from a client tick.
+	 */
+	public synchronized CompletableFuture<Boolean> checkForDiskChanges() {
+		if (changeCheckInFlight != null) return changeCheckInFlight;
+		CompletableFuture<Boolean> created = CompletableFuture.supplyAsync(() -> {
+			RepoRevision diskRevision = readDiskRevisionQuietly();
+			if (diskRevision == null || Objects.equals(diskRevision, loadedRevision)) return false;
+
+			LOGGER.info("NEU repo changed on disk ({} -> {}); reloading it now.",
+				describeRevision(loadedRevision), describeRevision(diskRevision));
+			NEURepository previous = loadedRepo.get();
+			NEURepository reloaded = loadFromDiskWithRetries();
+			return reloaded != null && reloaded != previous;
+		}, executor);
+		changeCheckInFlight = created;
+		created.whenComplete((changed, error) -> {
+			synchronized (NeuRepoManager.this) {
+				if (changeCheckInFlight == created) changeCheckInFlight = null;
+			}
+		});
+		return created;
+	}
+
+	/**
 	 * Compares the local repo against GitHub's latest commit and downloads an update if
 	 * there's a mismatch; otherwise leaves the on-disk copy untouched. Meant to be called
 	 * once per connection to a Hypixel server, not on every launch. No-ops entirely if another
@@ -128,10 +163,11 @@ public final class NeuRepoManager {
 			var newSha = downloader.checkForUpdate();
 			if (newSha.isEmpty()) return false;
 			boolean applied = downloader.downloadAndApply(newSha.get());
-			if (applied) {
-				loadFromDiskWithRetries();
-			}
-			return applied;
+			if (!applied) return false;
+			LOGGER.info("NEU repo changed after downloading {}; reloading it now.", newSha.get());
+			NEURepository previous = loadedRepo.get();
+			NEURepository reloaded = loadFromDiskWithRetries();
+			return reloaded != null && reloaded != previous;
 		}, executor);
 	}
 
@@ -146,20 +182,29 @@ public final class NeuRepoManager {
 		for (int attempt = 1; attempt <= 3; attempt++) {
 			NEURepository repository = NEURepository.of(repoDir);
 			try {
+				RepoRevision before = readDiskRevision();
 				repository.reload();
-				// Pre-build the derived recipe index on the background repo-loader thread so the
-				// first REI lookup does not have to walk every item. NPC-shop indexing is also
-				// kicked off here; it has its own worker because it reads raw item JSON from disk.
-				ensureRecipeCache(repository);
-				// Reforge/essence data lives in constants/*.json, which the repo download
-				// already puts on disk under repoDir regardless of whether NEURepository's own
-				// item parsing succeeded - reload these straight off disk here too, right after
-				// a confirmed-good repo load, so they stay in lockstep with it (same retry-on-
-				// failure behavior, same "another mod may be mid-rewrite" tolerance).
+				RepoRevision after = readDiskRevision();
+				if (!Objects.equals(before, after)) {
+					throw new IOException("shared repo changed while it was being parsed");
+				}
+				LOGGER.info("NEU repository reloaded from current disk contents ({} items).",
+					repository.getItems().getItems().size());
+
+				invalidateDerivedCaches(repository);
+				LOGGER.info("Invalidated repository-dependent item and recipe caches.");
+
 				ReforgeStore.getInstance().reload(repoDir);
 				EssenceStore.getInstance().reload(repoDir);
-				loadedRepo.set(repository);
-				NpcShopIndex.ensureBuilt(this, repository);
+				synchronized (recipeCacheLock) {
+					ensureRecipeCache(repository);
+					loadedRepo.set(repository);
+					loadedRevision = after;
+				}
+				NpcShopIndex.ensureBuilt(this, repository).handle((entries, error) -> null).join();
+				LOGGER.info("Rebuilt recipe data ({} crafting, {} forge, {} mob-drop, {} Kat upgrade, "
+					+ "{} NPC shop).", cachedCraftingRecipes.size(), cachedForgeRecipes.size(),
+					cachedMobDropRecipes.size(), cachedPetUpgradeRecipes.size(), NpcShopIndex.getEntries(this).size());
 				return repository;
 			} catch (Exception e) {
 				lastError = e;
@@ -181,6 +226,85 @@ public final class NeuRepoManager {
 
 	public NEURepository getLoadedRepoOrNull() {
 		return loadedRepo.get();
+	}
+
+	public String getLoadedRevisionKey() {
+		RepoRevision revision = loadedRevision;
+		return revision == null ? null : revision.cacheKey();
+	}
+
+	private void invalidateDerivedCaches(NEURepository repository) {
+		synchronized (recipeCacheLock) {
+			recipeCacheRepo = null;
+			cachedCraftingRecipes = List.of();
+			cachedForgeRecipes = List.of();
+			cachedMobDropRecipes = List.of();
+			cachedPetUpgradeRecipes = List.of();
+		}
+		NpcShopIndex.invalidate();
+		ReforgeStore.getInstance().invalidate();
+		EssenceStore.getInstance().invalidate();
+		PetStatResolver.invalidateCache();
+		SkyblockWikiManager.getInstance().invalidateCache();
+		SkyblockItemResolver.invalidateCache(repository);
+	}
+
+	private RepoRevision readDiskRevisionQuietly() {
+		try {
+			return readDiskRevision();
+		} catch (IOException e) {
+			LOGGER.debug("Could not inspect the shared NEU repo for changes ({}).", e.toString());
+			return null;
+		}
+	}
+
+	private RepoRevision readDiskRevision() throws IOException {
+		Path repoDir = downloader.getRepoDir();
+		if (!Files.isDirectory(repoDir)) return null;
+		RevisionAccumulator accumulator = new RevisionAccumulator();
+		accumulateRevision(repoDir, repoDir.resolve("items"), accumulator);
+		accumulateRevision(repoDir, repoDir.resolve("constants"), accumulator);
+		return new RepoRevision(downloader.loadSavedSha(), accumulator.fileCount,
+			accumulator.sum ^ Long.rotateLeft(accumulator.xor, 17));
+	}
+
+	private static void accumulateRevision(Path repoDir, Path root,
+			RevisionAccumulator accumulator) throws IOException {
+		if (!Files.isDirectory(root)) return;
+		try (var paths = Files.walk(root)) {
+			Iterator<Path> iterator = paths.iterator();
+			while (iterator.hasNext()) {
+				Path path = iterator.next();
+				if (!Files.isRegularFile(path) || !path.getFileName().toString().endsWith(".json")) continue;
+				BasicFileAttributes attributes = Files.readAttributes(path, BasicFileAttributes.class);
+				var modified = attributes.lastModifiedTime().toInstant();
+				int pathHash = repoDir.relativize(path).toString().hashCode();
+				long entry = pathHash;
+				entry = 31 * entry + attributes.size();
+				entry = 31 * entry + modified.getEpochSecond();
+				entry = 31 * entry + modified.getNano();
+				accumulator.fileCount++;
+				accumulator.sum += entry;
+				accumulator.xor ^= Long.rotateLeft(entry, pathHash & 63);
+			}
+		}
+	}
+
+	private static String describeRevision(RepoRevision revision) {
+		return revision == null ? "none" : revision.cacheKey();
+	}
+
+	private record RepoRevision(String sha, long fileCount, long fingerprint) {
+		String cacheKey() {
+			return (sha == null ? "unknown" : sha) + ":" + fileCount + ":"
+				+ Long.toUnsignedString(fingerprint, 16);
+		}
+	}
+
+	private static final class RevisionAccumulator {
+		private long fileCount;
+		private long sum;
+		private long xor;
 	}
 
 	/**
@@ -239,10 +363,12 @@ public final class NeuRepoManager {
 	}
 
 	public List<NEUCraftingRecipe> getCraftingRecipes() {
-		NEURepository repo = loadedRepo.get();
-		if (repo == null) return List.of();
-		ensureRecipeCache(repo);
-		return cachedCraftingRecipes;
+		synchronized (recipeCacheLock) {
+			NEURepository repo = loadedRepo.get();
+			if (repo == null) return List.of();
+			ensureRecipeCache(repo);
+			return cachedCraftingRecipes;
+		}
 	}
 
 	public List<io.github.moulberry.repo.data.NEUItem> getAllItems() {
@@ -252,26 +378,32 @@ public final class NeuRepoManager {
 	}
 
 	public List<NEUForgeRecipe> getForgeRecipes() {
-		NEURepository repo = loadedRepo.get();
-		if (repo == null) return List.of();
-		ensureRecipeCache(repo);
-		return cachedForgeRecipes;
+		synchronized (recipeCacheLock) {
+			NEURepository repo = loadedRepo.get();
+			if (repo == null) return List.of();
+			ensureRecipeCache(repo);
+			return cachedForgeRecipes;
+		}
 	}
 
 	/** Mob-drop tables (what a given mob drops, its XP/coins) embedded in the item repo. */
 	public List<NEUMobDropRecipe> getMobDropRecipes() {
-		NEURepository repo = loadedRepo.get();
-		if (repo == null) return List.of();
-		ensureRecipeCache(repo);
-		return cachedMobDropRecipes;
+		synchronized (recipeCacheLock) {
+			NEURepository repo = loadedRepo.get();
+			if (repo == null) return List.of();
+			ensureRecipeCache(repo);
+			return cachedMobDropRecipes;
+		}
 	}
 
 	/** Kat pet-rarity-upgrade recipes (e.g. Epic -> Legendary pet upgrades). */
 	public List<NEUKatUpgradeRecipe> getPetUpgradeRecipes() {
-		NEURepository repo = loadedRepo.get();
-		if (repo == null) return List.of();
-		ensureRecipeCache(repo);
-		return cachedPetUpgradeRecipes;
+		synchronized (recipeCacheLock) {
+			NEURepository repo = loadedRepo.get();
+			if (repo == null) return List.of();
+			ensureRecipeCache(repo);
+			return cachedPetUpgradeRecipes;
+		}
 	}
 
 }

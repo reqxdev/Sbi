@@ -42,6 +42,10 @@ public final class SkyblockWikiManager {
 		return cache.computeIfAbsent(skyblockId, this::loadWikiUrl);
 	}
 
+	public void invalidateCache() {
+		cache.clear();
+	}
+
 	private Optional<String> loadWikiUrl(String skyblockId) {
 		try {
 			Path file = NeuRepoManager.getInstance().getRepoDir()

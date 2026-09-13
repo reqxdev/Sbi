@@ -58,11 +58,15 @@ public final class SkyblockItemResolver {
 	 * NEURepository, including {@link #resolve}, so nothing needs to remember to invalidate
 	 * manually on a genuine reload of the underlying repo data.
 	 */
-	public static void invalidateCacheIfRepoChanged(NEURepository repository) {
+	public static synchronized void invalidateCacheIfRepoChanged(NEURepository repository) {
 		if (repository != null && repository != cachedForRepo) {
-			RESOLVED_CACHE.clear();
-			cachedForRepo = repository;
+			invalidateCache(repository);
 		}
+	}
+
+	public static synchronized void invalidateCache(NEURepository repository) {
+		RESOLVED_CACHE.clear();
+		cachedForRepo = repository;
 	}
 
 	/**

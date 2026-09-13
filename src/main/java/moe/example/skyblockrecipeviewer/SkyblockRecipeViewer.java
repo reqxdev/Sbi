@@ -26,6 +26,8 @@ import moe.example.skyblockrecipeviewer.repo.NeuRepoManager;
 public class SkyblockRecipeViewer implements ClientModInitializer {
 	public static final String MOD_ID = "skyblockrecipeviewer";
 	public static final Logger LOGGER = LogManager.getLogger("SkyblockRecipeViewer");
+	private static final long REPO_CHECK_INTERVAL_NANOS = java.util.concurrent.TimeUnit.SECONDS.toNanos(10);
+	private static long nextRepoCheckNanos;
 
 	@Override
 	public void onInitializeClient() {
@@ -36,8 +38,18 @@ public class SkyblockRecipeViewer implements ClientModInitializer {
 		// Prepare all local REI data as early as Minecraft's registries safely allow. This never
 		// blocks client startup or performs network I/O; network refreshes remain join-driven.
 		moe.example.skyblockrecipeviewer.rei.SkyblockReiPlugin.startBootstrap();
-		ClientTickEvents.END_CLIENT_TICK.register(client ->
-			moe.example.skyblockrecipeviewer.rei.SkyblockReiPlugin.processPendingItemCache());
+		ClientTickEvents.END_CLIENT_TICK.register(client -> {
+			moe.example.skyblockrecipeviewer.rei.SkyblockReiPlugin.processPendingItemCache();
+			moe.example.skyblockrecipeviewer.rei.SkyblockReiPlugin.processPendingReiRefresh();
+			long now = System.nanoTime();
+			if (now < nextRepoCheckNanos) return;
+			nextRepoCheckNanos = now + REPO_CHECK_INTERVAL_NANOS;
+			NeuRepoManager.getInstance().checkForDiskChanges().thenAccept(changed -> {
+				if (changed) {
+					moe.example.skyblockrecipeviewer.rei.SkyblockReiPlugin.onRepositoryReloaded();
+				}
+			});
+		});
 
 		ClientPlayConnectionEvents.JOIN.register((handler, sender, client) -> {
 			var server = client.getCurrentServer();
@@ -47,13 +59,13 @@ public class SkyblockRecipeViewer implements ClientModInitializer {
 			var repoUpdate = NeuRepoManager.getInstance().checkForUpdatesOnJoin();
 			repoUpdate.thenAccept(updated -> {
 				if (!updated) return;
-				LOGGER.info("SkyBlock item repo updated from GitHub.");
+				LOGGER.info("SkyBlock item repo updated from GitHub and reloaded.");
+				moe.example.skyblockrecipeviewer.rei.SkyblockReiPlugin.onRepositoryReloaded();
 				client.execute(() -> {
 					if (client.player != null) {
 						client.player.sendSystemMessage(Component.literal(
-							"[SkyBlock Recipe Viewer] Item repo updated - the item list will refresh "
-								+ "automatically, but recipe displays need a manual reload (Mod Menu -> "
-								+ "REI -> Reload Plugins) or restart to pick up new/changed recipes."));
+							"[SkyBlock Recipe Viewer] Item repo updated - items and recipes are "
+								+ "refreshing automatically."));
 					}
 				});
 			});

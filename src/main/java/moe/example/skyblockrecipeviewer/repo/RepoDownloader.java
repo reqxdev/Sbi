@@ -74,7 +74,7 @@ public final class RepoDownloader {
 		return repoDir;
 	}
 
-	private String loadSavedSha() {
+	String loadSavedSha() {
 		try {
 			if (Files.exists(repoDir) && Files.exists(commitFile)) {
 				JsonObject json = JsonParser.parseString(Files.readString(commitFile, StandardCharsets.UTF_8))

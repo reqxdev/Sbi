@@ -108,6 +108,13 @@ public final class NpcShopIndex {
 		return created;
 	}
 
+	public static synchronized void invalidate() {
+		cached = List.of();
+		builtForRepo = null;
+		buildingForRepo = null;
+		buildInFlight = null;
+	}
+
 	private static List<Entry> buildFromDisk(NeuRepoManager manager, NEURepository repo) {
 		Path itemsDir = manager.getRepoDir().resolve("items");
 		List<Entry> result = new ArrayList<>();
