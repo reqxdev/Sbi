@@ -76,7 +76,6 @@ public class SkyblockReiPlugin implements REIClientPlugin {
 	private static volatile NEURepository reiRefreshRunningRepo;
 	private static volatile boolean reiRefreshObserved;
 	private static volatile int reiRefreshStartTick;
-	private static volatile boolean reiRefreshEndStage;
 	private static int clientTick;
 
 	private record CachedItemLoad(NEURepository repository,
@@ -408,17 +407,9 @@ public class SkyblockReiPlugin implements REIClientPlugin {
 				return;
 			}
 			if (!reiRefreshObserved && clientTick - reiRefreshStartTick < 2) return;
-			if (!reiRefreshEndStage) {
-				reiRefreshEndStage = true;
-				reiRefreshObserved = false;
-				reiRefreshStartTick = clientTick;
-				me.shedaniel.rei.RoughlyEnoughItemsCoreClient.reloadPlugins(null,
-					me.shedaniel.rei.api.common.registry.ReloadStage.END);
-				return;
-			}
 			NEURepository refreshed = reiRefreshRunningRepo;
 			reiRefreshRunningRepo = null;
-			SkyblockRecipeViewer.LOGGER.info("REI refreshed for repository revision {}.",
+			SkyblockRecipeViewer.LOGGER.info("REI refresh completed for repository revision {}.",
 				NeuRepoManager.getInstance().getLoadedRevisionKey());
 			if (reiRefreshPendingRepo == refreshed) reiRefreshPendingRepo = null;
 		}
@@ -430,11 +421,11 @@ public class SkyblockReiPlugin implements REIClientPlugin {
 
 		reiRefreshRunningRepo = pending;
 		reiRefreshObserved = false;
-		reiRefreshEndStage = false;
 		reiRefreshStartTick = clientTick;
-		SkyblockRecipeViewer.LOGGER.info("Refreshing REI after repository recipes were rebuilt.");
+		SkyblockRecipeViewer.LOGGER.info("REI refresh requested after repository indexes were rebuilt.");
+		// A null stage asks REI to run START and END inside one managed reload task.
 		me.shedaniel.rei.RoughlyEnoughItemsCoreClient.reloadPlugins(null,
-			me.shedaniel.rei.api.common.registry.ReloadStage.START, minecraft.level.registryAccess());
+			null, minecraft.level.registryAccess());
 	}
 
 	private static boolean isReiReloading() {

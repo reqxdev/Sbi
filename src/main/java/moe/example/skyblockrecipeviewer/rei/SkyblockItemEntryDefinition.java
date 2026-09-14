@@ -1,6 +1,5 @@
 package moe.example.skyblockrecipeviewer.rei;
 
-import java.util.Locale;
 import java.util.stream.Stream;
 
 import me.shedaniel.rei.api.client.entry.renderer.EntryRenderer;
@@ -243,7 +242,7 @@ public final class SkyblockItemEntryDefinition implements EntryDefinition<ItemSt
 	public Identifier getIdentifier(EntryStack<ItemStack> entry, ItemStack value) {
 		String skyblockId = skyblockIdOf(value);
 		if (skyblockId == null) return vanilla().getIdentifier(entry, value);
-		return Identifier.fromNamespaceAndPath("sbitems", skyblockId.toLowerCase(Locale.ROOT));
+		return Identifier.fromNamespaceAndPath("sbitems", ReiIdentifierPath.normalize(skyblockId));
 	}
 
 	/**
@@ -334,7 +333,7 @@ public final class SkyblockItemEntryDefinition implements EntryDefinition<ItemSt
 		String skyblockId = skyblockIdOf(value);
 		if (skyblockId == null) return vanilla().getTagsFor(entry, value);
 		TagKey<Item> skyblockTag = TagKey.create(Registries.ITEM,
-			Identifier.fromNamespaceAndPath("skyblock", skyblockId.toLowerCase(Locale.ROOT)));
+			Identifier.fromNamespaceAndPath("skyblock", ReiIdentifierPath.normalize(skyblockId)));
 		return Stream.concat(vanilla().getTagsFor(entry, value), Stream.of(skyblockTag));
 	}
 

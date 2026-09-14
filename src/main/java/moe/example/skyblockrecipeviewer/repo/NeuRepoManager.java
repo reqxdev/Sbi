@@ -24,6 +24,19 @@ import org.apache.logging.log4j.Logger;
 
 public final class NeuRepoManager {
 	private static final Logger LOGGER = LogManager.getLogger("SkyblockRecipeViewer/Repo");
+	private static final long STABILITY_INTERVAL_MILLIS = 1_000;
+	private static final int MAX_STABILITY_OBSERVATIONS = 5;
+	private static final List<String> REQUIRED_REPO_FILES = List.of(
+		"constants/abiphone.json",
+		"constants/bonuses.json",
+		"constants/parents.json",
+		"constants/enchants.json",
+		"constants/essencecosts.json",
+		"constants/fairy_souls.json",
+		"constants/misc.json",
+		"constants/leveling.json",
+		"constants/pets.json",
+		"constants/petnums.json");
 
 	// Mods known to independently manage config/notenoughupdates/repo themselves. If any of
 	// these are present, we treat that folder as read-only: no downloading, no deleting, no
@@ -34,8 +47,8 @@ public final class NeuRepoManager {
 
 	private final RepoDownloader downloader;
 	private final boolean weManageRepo;
-	private final AtomicReference<NEURepository> loadedRepo = new AtomicReference<>();
-	private volatile RepoRevision loadedRevision;
+	private final long stabilityIntervalMillis;
+	private final AtomicReference<RepositoryData> loadedData = new AtomicReference<>();
 	private CompletableFuture<NEURepository> loadInFlight;
 	private CompletableFuture<Boolean> changeCheckInFlight;
 	private final java.util.concurrent.ExecutorService executor = Executors.newSingleThreadExecutor(r -> {
@@ -55,8 +68,13 @@ public final class NeuRepoManager {
 	}
 
 	NeuRepoManager(Path neuConfigDir, boolean weManageRepo) {
+		this(neuConfigDir, weManageRepo, STABILITY_INTERVAL_MILLIS);
+	}
+
+	NeuRepoManager(Path neuConfigDir, boolean weManageRepo, long stabilityIntervalMillis) {
 		this.downloader = new RepoDownloader(neuConfigDir, LOGGER);
 		this.weManageRepo = weManageRepo;
+		this.stabilityIntervalMillis = stabilityIntervalMillis;
 		if (!weManageRepo) {
 			LOGGER.info("Detected another installed mod that manages the shared NotEnoughUpdates "
 				+ "item repo - reading it read-only and letting that mod keep it updated instead of "
@@ -98,8 +116,8 @@ public final class NeuRepoManager {
 	 * past a caller's timeout even though the data was already available a moment earlier.
 	 */
 	public synchronized CompletableFuture<NEURepository> ensureLoaded() {
-		NEURepository cached = loadedRepo.get();
-		if (cached != null) return CompletableFuture.completedFuture(cached);
+		RepositoryData cached = loadedData.get();
+		if (cached != null) return CompletableFuture.completedFuture(cached.repository());
 		return loadAsync();
 	}
 
@@ -124,11 +142,13 @@ public final class NeuRepoManager {
 		if (changeCheckInFlight != null) return changeCheckInFlight;
 		CompletableFuture<Boolean> created = CompletableFuture.supplyAsync(() -> {
 			RepoRevision diskRevision = readDiskRevisionQuietly();
-			if (diskRevision == null || Objects.equals(diskRevision, loadedRevision)) return false;
+			RepositoryData current = loadedData.get();
+			String loadedRevision = current == null ? null : current.revisionKey();
+			if (diskRevision == null || Objects.equals(diskRevision.cacheKey(), loadedRevision)) return false;
 
-			LOGGER.info("NEU repo changed on disk ({} -> {}); reloading it now.",
-				describeRevision(loadedRevision), describeRevision(diskRevision));
-			NEURepository previous = loadedRepo.get();
+			LOGGER.info("NEU repo change detected on disk ({} -> {}).",
+				loadedRevision == null ? "none" : loadedRevision, describeRevision(diskRevision));
+			NEURepository previous = current == null ? null : current.repository();
 			NEURepository reloaded = loadFromDiskWithRetries();
 			return reloaded != null && reloaded != previous;
 		}, executor);
@@ -164,83 +184,111 @@ public final class NeuRepoManager {
 			if (newSha.isEmpty()) return false;
 			boolean applied = downloader.downloadAndApply(newSha.get());
 			if (!applied) return false;
-			LOGGER.info("NEU repo changed after downloading {}; reloading it now.", newSha.get());
-			NEURepository previous = loadedRepo.get();
+			LOGGER.info("NEU repo change detected after downloading {}.", newSha.get());
+			RepositoryData current = loadedData.get();
+			NEURepository previous = current == null ? null : current.repository();
 			NEURepository reloaded = loadFromDiskWithRetries();
 			return reloaded != null && reloaded != previous;
 		}, executor);
 	}
 
 	/**
-	 * Retries a few times with a short delay before giving up, since a transient read failure
-	 * here usually just means another mod is mid-rewrite of the same shared folder right now,
-	 * not that anything is actually broken.
+	 * Waits for two identical, complete snapshots before parsing. A failed parse never replaces
+	 * the current repository or invalidates its derived caches.
 	 */
 	private NEURepository loadFromDiskWithRetries() {
 		Path repoDir = downloader.getRepoDir();
-		Exception lastError = null;
-		for (int attempt = 1; attempt <= 3; attempt++) {
-			NEURepository repository = NEURepository.of(repoDir);
-			try {
-				RepoRevision before = readDiskRevision();
-				repository.reload();
-				RepoRevision after = readDiskRevision();
-				if (!Objects.equals(before, after)) {
-					throw new IOException("shared repo changed while it was being parsed");
-				}
-				LOGGER.info("NEU repository reloaded from current disk contents ({} items).",
-					repository.getItems().getItems().size());
+		RepositoryData previous = loadedData.get();
+		RepoRevision stableRevision = awaitStableRevision();
+		if (stableRevision == null) return previous == null ? null : previous.repository();
 
-				invalidateDerivedCaches(repository);
-				LOGGER.info("Invalidated repository-dependent item and recipe caches.");
-
-				ReforgeStore.getInstance().reload(repoDir);
-				EssenceStore.getInstance().reload(repoDir);
-				synchronized (recipeCacheLock) {
-					ensureRecipeCache(repository);
-					loadedRepo.set(repository);
-					loadedRevision = after;
-				}
-				NpcShopIndex.ensureBuilt(this, repository).handle((entries, error) -> null).join();
-				LOGGER.info("Rebuilt recipe data ({} crafting, {} forge, {} mob-drop, {} Kat upgrade, "
-					+ "{} NPC shop).", cachedCraftingRecipes.size(), cachedForgeRecipes.size(),
-					cachedMobDropRecipes.size(), cachedPetUpgradeRecipes.size(), NpcShopIndex.getEntries(this).size());
-				return repository;
-			} catch (Exception e) {
-				lastError = e;
-				if (attempt < 3) {
-					try {
-						Thread.sleep(1500);
-					} catch (InterruptedException interrupted) {
-						Thread.currentThread().interrupt();
-						break;
-					}
-				}
+		NEURepository repository = NEURepository.of(repoDir);
+		RepositoryData replacement;
+		try {
+			repository.reload();
+			RepoRevision after = readCompleteDiskRevision();
+			if (!Objects.equals(stableRevision, after)) {
+				LOGGER.warn("NEU repo load aborted because the shared snapshot changed while it was parsed "
+					+ "({} -> {}). Keeping the previous repository.",
+					describeRevision(stableRevision), describeRevision(after));
+				return previous == null ? null : previous.repository();
 			}
+
+			replacement = buildRepositoryData(repository, after);
+		} catch (Exception e) {
+			LOGGER.warn("NEU repo load failed or was aborted because the snapshot may be incomplete or "
+				+ "mid-update. Keeping the previous valid repository at {}.",
+				previous == null ? "none" : previous.revisionKey(), e);
+			return previous == null ? null : previous.repository();
 		}
-		LOGGER.error("Failed to parse SkyBlock item repo at {} after 3 attempts - if another "
-			+ "SkyBlock mod also manages this folder, it may just have been mid-update each time; "
-			+ "this should resolve itself on the next reload.", repoDir, lastError);
-		return loadedRepo.get();
+
+		int oldForgeCount = previous == null ? 0 : previous.forgeRecipes().size();
+		loadedData.set(replacement);
+		LOGGER.info("Successfully replaced the active NEU repository at revision {} ({} items).",
+			replacement.revisionKey(), repository.getItems().getItems().size());
+
+		try {
+			invalidateDerivedCaches(repository);
+			LOGGER.info("Invalidated caches and indexes derived from the previous NEU repository.");
+			ReforgeStore.getInstance().reload(repoDir);
+			EssenceStore.getInstance().reload(repoDir);
+			NpcShopIndex.ensureBuilt(this, repository).handle((entries, error) -> {
+				if (error != null) LOGGER.warn("Failed to rebuild the NPC shop index.", error);
+				return entries;
+			}).join();
+		} catch (Exception e) {
+			LOGGER.error("The NEU repository was replaced, but a derived cache rebuild failed.", e);
+		}
+		LOGGER.info("Rebuilt repository indexes ({} crafting, {} Forge, {} mob-drop, {} Kat upgrade, "
+			+ "{} NPC shop). Forge recipe count: {} -> {}.", replacement.craftingRecipes().size(),
+			replacement.forgeRecipes().size(), replacement.mobDropRecipes().size(),
+			replacement.petUpgradeRecipes().size(), NpcShopIndex.getEntries(this).size(),
+			oldForgeCount, replacement.forgeRecipes().size());
+		return repository;
+	}
+
+	private RepoRevision awaitStableRevision() {
+		RepoRevision previous = null;
+		for (int observation = 1; observation <= MAX_STABILITY_OBSERVATIONS; observation++) {
+			try {
+				RepoRevision current = readCompleteDiskRevision();
+				if (Objects.equals(previous, current)) return current;
+				previous = current;
+				LOGGER.info("Waiting for stable NEU repo snapshot at {} (observation {}/{}).",
+					describeRevision(current), observation, MAX_STABILITY_OBSERVATIONS);
+			} catch (Exception e) {
+				previous = null;
+				LOGGER.info("Waiting for stable NEU repo snapshot: {} (observation {}/{}).",
+					e.getMessage(), observation, MAX_STABILITY_OBSERVATIONS);
+			}
+			if (observation < MAX_STABILITY_OBSERVATIONS && !pauseForStability()) return null;
+		}
+		LOGGER.warn("NEU repo load aborted because no complete stable snapshot was observed. "
+			+ "Keeping the previous repository.");
+		return null;
+	}
+
+	private boolean pauseForStability() {
+		try {
+			Thread.sleep(stabilityIntervalMillis);
+			return true;
+		} catch (InterruptedException e) {
+			Thread.currentThread().interrupt();
+			return false;
+		}
 	}
 
 	public NEURepository getLoadedRepoOrNull() {
-		return loadedRepo.get();
+		RepositoryData data = loadedData.get();
+		return data == null ? null : data.repository();
 	}
 
 	public String getLoadedRevisionKey() {
-		RepoRevision revision = loadedRevision;
-		return revision == null ? null : revision.cacheKey();
+		RepositoryData data = loadedData.get();
+		return data == null ? null : data.revisionKey();
 	}
 
 	private void invalidateDerivedCaches(NEURepository repository) {
-		synchronized (recipeCacheLock) {
-			recipeCacheRepo = null;
-			cachedCraftingRecipes = List.of();
-			cachedForgeRecipes = List.of();
-			cachedMobDropRecipes = List.of();
-			cachedPetUpgradeRecipes = List.of();
-		}
 		NpcShopIndex.invalidate();
 		ReforgeStore.getInstance().invalidate();
 		EssenceStore.getInstance().invalidate();
@@ -252,7 +300,7 @@ public final class NeuRepoManager {
 	private RepoRevision readDiskRevisionQuietly() {
 		try {
 			return readDiskRevision();
-		} catch (IOException e) {
+		} catch (Exception e) {
 			LOGGER.debug("Could not inspect the shared NEU repo for changes ({}).", e.toString());
 			return null;
 		}
@@ -266,6 +314,30 @@ public final class NeuRepoManager {
 		accumulateRevision(repoDir, repoDir.resolve("constants"), accumulator);
 		return new RepoRevision(downloader.loadSavedSha(), accumulator.fileCount,
 			accumulator.sum ^ Long.rotateLeft(accumulator.xor, 17));
+	}
+
+	private RepoRevision readCompleteDiskRevision() throws IOException {
+		Path repoDir = downloader.getRepoDir();
+		if (!Files.isDirectory(repoDir.resolve("items"))) {
+			throw new IOException("required directory items is missing");
+		}
+		if (!Files.isDirectory(repoDir.resolve("constants"))) {
+			throw new IOException("required directory constants is missing");
+		}
+		for (String required : REQUIRED_REPO_FILES) {
+			if (!Files.isRegularFile(repoDir.resolve(required))) {
+				throw new IOException("required file " + required + " is missing");
+			}
+		}
+		try (var items = Files.list(repoDir.resolve("items"))) {
+			if (items.noneMatch(path -> Files.isRegularFile(path)
+					&& path.getFileName().toString().endsWith(".json"))) {
+				throw new IOException("required directory items contains no JSON files");
+			}
+		}
+		RepoRevision revision = readDiskRevision();
+		if (revision == null) throw new IOException("repo directory is missing");
+		return revision;
 	}
 
 	private static void accumulateRevision(Path repoDir, Path root,
@@ -307,103 +379,73 @@ public final class NeuRepoManager {
 		private long xor;
 	}
 
-	/**
-	 * Recipe data is embedded in every NEU item. The old implementation walked all ~9k
-	 * items every time REI asked for a focused recipe/usage view, then repeated that work for
-	 * crafting, forge, mob-drop and Kat recipes independently. REI can call those generators
-	 * frequently while hovering/searching, so cache the extracted lists for the current repo.
-	 * The cache is keyed by the NEURepository instance: a real repo reload produces a new
-	 * instance and therefore automatically invalidates it.
-	 */
-	private final Object recipeCacheLock = new Object();
-	private volatile NEURepository recipeCacheRepo;
-	private volatile List<NEUCraftingRecipe> cachedCraftingRecipes = List.of();
-	private volatile List<NEUForgeRecipe> cachedForgeRecipes = List.of();
-	private volatile List<NEUMobDropRecipe> cachedMobDropRecipes = List.of();
-	private volatile List<NEUKatUpgradeRecipe> cachedPetUpgradeRecipes = List.of();
+	public record RepositoryData(NEURepository repository, String revisionKey,
+			List<NEUCraftingRecipe> craftingRecipes, List<NEUForgeRecipe> forgeRecipes,
+			List<NEUMobDropRecipe> mobDropRecipes, List<NEUKatUpgradeRecipe> petUpgradeRecipes) {
+	}
 
-	private void ensureRecipeCache(NEURepository repo) {
-		if (recipeCacheRepo == repo) return;
-		synchronized (recipeCacheLock) {
-			if (recipeCacheRepo == repo) return;
+	private static RepositoryData buildRepositoryData(NEURepository repo, RepoRevision revision) {
+		List<NEUCraftingRecipe> crafting = new java.util.ArrayList<>();
+		List<NEUForgeRecipe> forge = new java.util.ArrayList<>();
+		List<NEUMobDropRecipe> mobDrops = new java.util.ArrayList<>();
+		List<NEUKatUpgradeRecipe> petUpgrades = new java.util.ArrayList<>();
 
-			List<NEUCraftingRecipe> crafting = new java.util.ArrayList<>();
-			List<NEUForgeRecipe> forge = new java.util.ArrayList<>();
-			List<NEUMobDropRecipe> mobDrops = new java.util.ArrayList<>();
-			List<NEUKatUpgradeRecipe> petUpgrades = new java.util.ArrayList<>();
+		for (io.github.moulberry.repo.data.NEUItem item : repo.getItems().getItems().values()) {
+			var recipes = item.getRecipes();
+			if (recipes == null || recipes.isEmpty()) continue;
 
-			for (io.github.moulberry.repo.data.NEUItem item : repo.getItems().getItems().values()) {
-				var recipes = item.getRecipes();
-				if (recipes == null || recipes.isEmpty()) continue;
+			List<NEUCraftingRecipe> itemCrafting = new java.util.ArrayList<>();
+			List<NEUForgeRecipe> itemForge = new java.util.ArrayList<>();
+			List<NEUMobDropRecipe> itemMobDrops = new java.util.ArrayList<>();
+			List<NEUKatUpgradeRecipe> itemPetUpgrades = new java.util.ArrayList<>();
 
-				List<NEUCraftingRecipe> itemCrafting = new java.util.ArrayList<>();
-				List<NEUForgeRecipe> itemForge = new java.util.ArrayList<>();
-				List<NEUMobDropRecipe> itemMobDrops = new java.util.ArrayList<>();
-				List<NEUKatUpgradeRecipe> itemPetUpgrades = new java.util.ArrayList<>();
-
-				for (var recipe : recipes) {
-					if (recipe instanceof NEUCraftingRecipe r) itemCrafting.add(r);
-					if (recipe instanceof NEUForgeRecipe r) itemForge.add(r);
-					if (recipe instanceof NEUMobDropRecipe r) itemMobDrops.add(r);
-					if (recipe instanceof NEUKatUpgradeRecipe r) itemPetUpgrades.add(r);
-				}
-
-				crafting.addAll(RecipeDedup.dedupe(itemCrafting, RecipeDedup::craftingSignature));
-				forge.addAll(RecipeDedup.dedupe(itemForge, RecipeDedup::forgeSignature));
-				mobDrops.addAll(RecipeDedup.dedupe(itemMobDrops, RecipeDedup::mobDropSignature));
-				petUpgrades.addAll(RecipeDedup.dedupe(itemPetUpgrades, RecipeDedup::katUpgradeSignature));
+			for (var recipe : recipes) {
+				if (recipe instanceof NEUCraftingRecipe r) itemCrafting.add(r);
+				if (recipe instanceof NEUForgeRecipe r) itemForge.add(r);
+				if (recipe instanceof NEUMobDropRecipe r) itemMobDrops.add(r);
+				if (recipe instanceof NEUKatUpgradeRecipe r) itemPetUpgrades.add(r);
 			}
 
-			cachedCraftingRecipes = List.copyOf(crafting);
-			cachedForgeRecipes = List.copyOf(forge);
-			cachedMobDropRecipes = List.copyOf(mobDrops);
-			cachedPetUpgradeRecipes = List.copyOf(petUpgrades);
-			recipeCacheRepo = repo;
+			crafting.addAll(RecipeDedup.dedupe(itemCrafting, RecipeDedup::craftingSignature));
+			forge.addAll(RecipeDedup.dedupe(itemForge, RecipeDedup::forgeSignature));
+			mobDrops.addAll(RecipeDedup.dedupe(itemMobDrops, RecipeDedup::mobDropSignature));
+			petUpgrades.addAll(RecipeDedup.dedupe(itemPetUpgrades, RecipeDedup::katUpgradeSignature));
 		}
+
+		return new RepositoryData(repo, revision.cacheKey(), List.copyOf(crafting), List.copyOf(forge),
+			List.copyOf(mobDrops), List.copyOf(petUpgrades));
+	}
+
+	public RepositoryData getRepositoryDataOrNull() {
+		return loadedData.get();
 	}
 
 	public List<NEUCraftingRecipe> getCraftingRecipes() {
-		synchronized (recipeCacheLock) {
-			NEURepository repo = loadedRepo.get();
-			if (repo == null) return List.of();
-			ensureRecipeCache(repo);
-			return cachedCraftingRecipes;
-		}
+		RepositoryData data = loadedData.get();
+		return data == null ? List.of() : data.craftingRecipes();
 	}
 
 	public List<io.github.moulberry.repo.data.NEUItem> getAllItems() {
-		NEURepository repo = loadedRepo.get();
-		if (repo == null) return List.of();
-		return List.copyOf(repo.getItems().getItems().values());
+		RepositoryData data = loadedData.get();
+		if (data == null) return List.of();
+		return List.copyOf(data.repository().getItems().getItems().values());
 	}
 
 	public List<NEUForgeRecipe> getForgeRecipes() {
-		synchronized (recipeCacheLock) {
-			NEURepository repo = loadedRepo.get();
-			if (repo == null) return List.of();
-			ensureRecipeCache(repo);
-			return cachedForgeRecipes;
-		}
+		RepositoryData data = loadedData.get();
+		return data == null ? List.of() : data.forgeRecipes();
 	}
 
 	/** Mob-drop tables (what a given mob drops, its XP/coins) embedded in the item repo. */
 	public List<NEUMobDropRecipe> getMobDropRecipes() {
-		synchronized (recipeCacheLock) {
-			NEURepository repo = loadedRepo.get();
-			if (repo == null) return List.of();
-			ensureRecipeCache(repo);
-			return cachedMobDropRecipes;
-		}
+		RepositoryData data = loadedData.get();
+		return data == null ? List.of() : data.mobDropRecipes();
 	}
 
 	/** Kat pet-rarity-upgrade recipes (e.g. Epic -> Legendary pet upgrades). */
 	public List<NEUKatUpgradeRecipe> getPetUpgradeRecipes() {
-		synchronized (recipeCacheLock) {
-			NEURepository repo = loadedRepo.get();
-			if (repo == null) return List.of();
-			ensureRecipeCache(repo);
-			return cachedPetUpgradeRecipes;
-		}
+		RepositoryData data = loadedData.get();
+		return data == null ? List.of() : data.petUpgradeRecipes();
 	}
 
 }

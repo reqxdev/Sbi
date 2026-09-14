@@ -4,7 +4,6 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
 
-import io.github.moulberry.repo.NEURepository;
 import io.github.moulberry.repo.data.NEUMobDropRecipe;
 import me.shedaniel.rei.api.client.registry.display.DynamicDisplayGenerator;
 import me.shedaniel.rei.api.client.view.ViewSearchBuilder;
@@ -35,12 +34,11 @@ public final class SkyblockMobDropDisplayGenerator implements DynamicDisplayGene
 			return Optional.empty();
 		}
 
-		NeuRepoManager manager = NeuRepoManager.getInstance();
-		NEURepository repository = manager.getLoadedRepoOrNull();
-		if (repository == null) return Optional.empty();
+		NeuRepoManager.RepositoryData data = NeuRepoManager.getInstance().getRepositoryDataOrNull();
+		if (data == null) return Optional.empty();
 
 		List<SkyblockMobDropDisplay> displays = new ArrayList<>();
-		for (NEUMobDropRecipe recipe : manager.getMobDropRecipes()) {
+		for (NEUMobDropRecipe recipe : data.mobDropRecipes()) {
 			if (recipe.getDrops() == null) continue;
 			boolean dropsThisItem = false;
 			for (io.github.moulberry.repo.data.NEUMobDropRecipe.Drop drop : recipe.getDrops()) {
@@ -52,7 +50,7 @@ public final class SkyblockMobDropDisplayGenerator implements DynamicDisplayGene
 				}
 			}
 			if (!dropsThisItem) continue;
-			SkyblockMobDropDisplay display = SkyblockReiPlugin.toMobDropDisplay(repository, recipe);
+			SkyblockMobDropDisplay display = SkyblockReiPlugin.toMobDropDisplay(data.repository(), recipe);
 			if (display != null) displays.add(display);
 		}
 		return displays.isEmpty() ? Optional.empty() : Optional.of(displays);
@@ -66,13 +64,12 @@ public final class SkyblockMobDropDisplayGenerator implements DynamicDisplayGene
 	@Override
 	public Optional<List<SkyblockMobDropDisplay>> generate(ViewSearchBuilder builder) {
 		if (!builder.getRecipesFor().isEmpty() || !builder.getUsagesFor().isEmpty()) return Optional.empty();
-		NeuRepoManager manager = NeuRepoManager.getInstance();
-		NEURepository repository = manager.getLoadedRepoOrNull();
-		if (repository == null) return Optional.empty();
+		NeuRepoManager.RepositoryData data = NeuRepoManager.getInstance().getRepositoryDataOrNull();
+		if (data == null) return Optional.empty();
 
 		List<SkyblockMobDropDisplay> displays = new ArrayList<>();
-		for (NEUMobDropRecipe recipe : manager.getMobDropRecipes()) {
-			SkyblockMobDropDisplay display = SkyblockReiPlugin.toMobDropDisplay(repository, recipe);
+		for (NEUMobDropRecipe recipe : data.mobDropRecipes()) {
+			SkyblockMobDropDisplay display = SkyblockReiPlugin.toMobDropDisplay(data.repository(), recipe);
 			if (display != null) displays.add(display);
 		}
 		return Optional.of(displays);

@@ -5,7 +5,6 @@ import java.util.List;
 import java.util.Optional;
 import java.util.function.Predicate;
 
-import io.github.moulberry.repo.NEURepository;
 import io.github.moulberry.repo.data.NEUKatUpgradeRecipe;
 import me.shedaniel.rei.api.client.registry.display.DynamicDisplayGenerator;
 import me.shedaniel.rei.api.client.view.ViewSearchBuilder;
@@ -78,14 +77,13 @@ public final class SkyblockPetUpgradeDisplayGenerator
 	}
 
 	private static List<SkyblockPetUpgradeDisplay> buildDisplays(Predicate<NEUKatUpgradeRecipe> filter) {
-		NeuRepoManager manager = NeuRepoManager.getInstance();
-		NEURepository repository = manager.getLoadedRepoOrNull();
-		if (repository == null) return List.of();
+		NeuRepoManager.RepositoryData data = NeuRepoManager.getInstance().getRepositoryDataOrNull();
+		if (data == null) return List.of();
 
 		List<SkyblockPetUpgradeDisplay> displays = new ArrayList<>();
-		for (NEUKatUpgradeRecipe recipe : manager.getPetUpgradeRecipes()) {
+		for (NEUKatUpgradeRecipe recipe : data.petUpgradeRecipes()) {
 			if (!filter.test(recipe)) continue;
-			SkyblockPetUpgradeDisplay display = SkyblockReiPlugin.toPetUpgradeDisplay(repository, recipe);
+			SkyblockPetUpgradeDisplay display = SkyblockReiPlugin.toPetUpgradeDisplay(data.repository(), recipe);
 			if (display != null) displays.add(display);
 		}
 		return displays;

@@ -5,7 +5,6 @@ import java.util.List;
 import java.util.Optional;
 import java.util.function.Predicate;
 
-import io.github.moulberry.repo.NEURepository;
 import io.github.moulberry.repo.data.NEUCraftingRecipe;
 import io.github.moulberry.repo.data.NEUIngredient;
 import me.shedaniel.rei.api.client.registry.display.DynamicDisplayGenerator;
@@ -124,14 +123,13 @@ public final class SkyblockCraftingDisplayGenerator implements DynamicDisplayGen
 	}
 
 	private static List<SkyblockCraftingDisplay> buildDisplays(Predicate<NEUCraftingRecipe> filter) {
-		NeuRepoManager manager = NeuRepoManager.getInstance();
-		NEURepository repository = manager.getLoadedRepoOrNull();
-		if (repository == null) return List.of();
+		NeuRepoManager.RepositoryData data = NeuRepoManager.getInstance().getRepositoryDataOrNull();
+		if (data == null) return List.of();
 
 		List<SkyblockCraftingDisplay> displays = new ArrayList<>();
-		for (NEUCraftingRecipe recipe : manager.getCraftingRecipes()) {
+		for (NEUCraftingRecipe recipe : data.craftingRecipes()) {
 			if (!filter.test(recipe)) continue;
-			SkyblockCraftingDisplay display = SkyblockReiPlugin.toDisplay(repository, recipe);
+			SkyblockCraftingDisplay display = SkyblockReiPlugin.toDisplay(data.repository(), recipe);
 			if (display != null) displays.add(display);
 		}
 		return displays;
