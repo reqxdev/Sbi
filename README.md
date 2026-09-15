@@ -2,7 +2,7 @@
 This is not a re-creation of Firmament just some of its features without snitching the users mods list
 
 # AI Disclosure
-This project was created entirely by AI
+This project was created entirely by AI by MGHusky
 
 # Dependencies
 - MC 26.2
